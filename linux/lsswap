@@ -1,0 +1,14 @@
+#!/bin/bash
+
+printf "%-14s %-14s %-20s\n" "SWAP(MB)" "PID" "PROCESS"
+for file in /proc/*/status
+do
+  PID=$(awk '/^Pid:/{ printf $2 }' ${file})
+  PROC=$(awk '/Name:/{ printf $2 }' ${file})
+  SWAP=$(awk '/VmSwap:/{ printf $2/1024 }' ${file})
+
+  if [ -n "${SWAP}" ]
+  then
+    printf "%-14.2f %-14d %-20s\n" ${SWAP} ${PID} ${PROC}
+  fi
+done | sort -k 1 -n -r | head -10

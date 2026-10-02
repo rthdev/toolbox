@@ -1,0 +1,71 @@
+#!/bin/bash
+#
+### Git Kustomize Check ###
+
+# Initialize exit variable
+failed=0
+
+# Check if we are in a git repo, otherwise fail
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 || {
+  echo "Not inside a git repository"
+  exit 1
+}
+
+# Gather all directories with kustomization.yaml
+all_changes=$(find . -type f -name kustomization.yaml)
+
+if [[ -z "${all_changes}" ]]; then
+  echo "No changes in repository detected, exiting"
+  exit 0
+fi
+
+# Construct a directory list
+dirs=$(echo "${all_changes}" | xargs dirname | sort -u)
+
+# Loop over directories checking for kustomize consistency
+for dir in ${dirs}; do
+  kfile="${dir}/kustomization.yaml"
+
+  if [[ ! -f "${kfile}" ]]; then
+    echo "Skipping ${dir} (no kustomization.yaml)"
+    continue
+  fi
+
+  echo "Checking ${dir} ..."
+  echo -n "... Can kustomize ..."
+  if oc kustomize "${dir}" > /dev/null; then
+    echo "OK"
+  else
+    echo "FAILED"
+    failed=1
+  fi
+
+  files_in_dir=$(ls -I kustomization.yaml ${dir})
+  if [[ -z "${files_in_dir}" ]]; then
+    continue
+  fi
+
+  echo -n "... All files in kustomization.yaml ..."
+
+  file_failed=0
+  file_failed_detail=""
+
+  for file in ${files_in_dir}; do
+    if ! grep ${file} ${kfile} >/dev/null; then
+      failed=1
+      file_failed=1
+      file_failed_detail="${file_failed_detail}... File ${file} not found in ${kfile}"
+    fi
+  done
+
+  if [[ "${file_failed}" -eq 1 ]]; then
+    echo "FAILED"
+    echo ${file_failed_detail}
+  else
+    echo "OK"
+  fi
+
+done
+
+
+exit ${failed}

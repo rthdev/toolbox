@@ -1,0 +1,37 @@
+#!/bin/bash
+
+container_count=0
+declare -a containers_unsorted
+declare -a containers_sorted
+
+# Collect ps output for further processing
+ps_out="$(ps -eo pid,user:20,args | grep [c]onmon)"
+
+# Bail out if there's no conmon process
+if [ $? -ne 0 ]
+then
+  exit 99
+fi
+
+# Read ps output into array
+readarray -t CONMONS <<< $(echo "${ps_out}")
+
+# Wade through output and collect what is needed
+for conmon in "${CONMONS[@]}"
+do
+  user=$(echo "${conmon}" | awk '{ print $2 }')
+  container=$(echo "${conmon}" | grep -oh "[[:space:]]-n[[:space:]][[:alnum:][:punct:]]*" | awk '{ print $2 }')
+  containers_unsorted+=("${user}:${container}")
+done
+
+# Sort array
+readarray -t containers_sorted < <(for a in "${containers_unsorted[@]}"; do echo "$a"; done | sort)
+
+
+containercount=${#containers_sorted[@]}
+
+# Print running podman containers
+for cont in "${containers_sorted[@]}"
+do
+  echo $cont
+done
