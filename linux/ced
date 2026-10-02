@@ -1,0 +1,53 @@
+#!/bin/bash
+# Certificate Expiration Date (ced) Checker
+
+# Configure to your liking
+REDWHENLESSTHANDAYS=30
+YELLOWWHENLESSTHANDAYS=90
+DIFFCMD="/usr/bin/datediff"
+
+# Terminal colors
+red=$(tput setaf 1)
+green=$(tput setaf 2)
+yellow=$(tput setaf 3)
+reset=$(tput sgr0)
+COLOR=${reset}
+
+# Simply check if 1 argument has been given. No more sanity checks done
+if [ -z "$1" ]
+then
+  echo "please enter host:port as argument"
+else
+  # If we have no colon, assume :443
+  if [[ ! "${1}" =~ :[0-9]+$ ]];
+  then
+    TARGET="${1}:443"
+  else
+    TARGET="${1}"
+  fi
+
+  DATES=$(echo | openssl s_client -connect ${TARGET} 2>/dev/null | openssl x509 -noout -dates)
+  DATE_START=$(echo $DATES | grep notBefore | awk -F"=" '{ print $NF }')
+  DATE_END=$(echo $DATES | grep notAfter | awk -F"=" '{ print $NF }')
+  
+  
+  if [ -x "${DIFFCMD}" ]
+  then
+    DAYS_TO_END=$(${DIFFCMD} -i "%b %d %H:%M:%S %Y %Z" -f "%d" now "${DATE_END}")
+    COLOR="${green}"
+  
+    if [ ${DAYS_TO_END} -lt ${YELLOWWHENLESSTHANDAYS} ]
+    then
+      COLOR=${yellow}
+    fi
+  
+    if [ ${DAYS_TO_END} -lt ${REDWHENLESSTHANDAYS} ]
+    then
+      COLOR=${red}
+    fi
+  
+  fi
+  
+  echo "EXPIRES: ${COLOR}${DATE_END}${reset}" 
+  
+fi
