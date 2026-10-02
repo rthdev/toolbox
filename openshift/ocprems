@@ -1,0 +1,15 @@
+#!/bin/bash
+
+REMOVEDAPISFULL=$(oc get apirequestcounts -o jsonpath='{range .items[?(@.status.removedInRelease!="")]}{.status.removedInRelease}{"\t"}{.status.requestCount}{"\t"}{.metadata.name}{"\n"}{end}')
+
+REMOVEDAPIS=$(echo "${REMOVEDAPISFULL}" | awk '{ print $NF }' | tr '\n' ' ')
+
+for api in ${REMOVEDAPIS}
+do
+  echo "${api}"
+  echo "==============="
+  oc get apirequestcounts ${api} -o jsonpath='{range .status.last24h..byUser[*]}{..byVerb[*].verb}{","}{.username}{","}{.userAgent}{"\n"}{end}'   | sort -k 2 -t, -u | column -t -s ","
+  echo "==============="
+  echo
+done
+

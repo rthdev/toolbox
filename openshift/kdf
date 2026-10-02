@@ -1,0 +1,55 @@
+#!/bin/bash
+# Kubernetes Disk Free - kdf
+
+pv_disk_free () {
+  pvc=$1
+
+  if [[ -z "${pvc}" ]]; then
+    echo "ERROR: no pvc specified, exiting..."
+    exit 1
+  fi
+  
+  kubectl get pvc ${pvc} > /dev/null 2>&1
+  if [[ $? -ne 0 ]]; then
+    echo "ERROR: no pvc with name ${pvc} found, exiting..."
+    exit 1
+  fi
+
+  pod=$(kubectl get pod -o json | jq -r "
+    .items[] |
+    select(.spec.volumes[]?.persistentVolumeClaim.claimName==\"${pvc}\") |
+            .metadata.name" | head -1)
+  if [ -z "${pod}" ]; then
+    echo "WARNING: No pods found"
+  else
+    volname=$(kubectl get pod ${pod} -o json | jq -r "
+      .spec.volumes[] |
+      select(.persistentVolumeClaim.claimName==\"${pvc}\") |
+      .name")
+    
+    mntpath=$(kubectl get pod ${pod} -o json | jq -r "
+      .spec.containers[].volumeMounts[] |
+      select(.name==\"${volname}\") |
+      .mountPath")
+    
+    kubectl exec ${pod} -- df -h ${mntpath}
+  fi
+}
+
+if [[ -n $1 ]]; then
+  pv_disk_free $1
+else
+  pvc_list=$(kubectl get pvc --no-headers | awk '{ print $1 }')
+
+  if [[ $? -ne 0 ]]; then
+    echo "ERROR: no pvcs found, exiting..."
+    exit 1
+  fi
+
+  for cur_pvc in ${pvc_list}
+  do
+    echo "${cur_pvc}: "
+    pv_disk_free $cur_pvc
+    echo
+  done
+fi
