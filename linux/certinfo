@@ -1,60 +1,24 @@
 #!/bin/bash
-# Notes:
-#   - Lists CN, SANs and Expiry date of certificate
-#   - should've been done in python, but it was quick and dirty.
-
-
-########################
-# Global Constans and Vars
-########################
-EXIT_CODE=0
-DEFAULT_PORT=443
-
-
-
-########################
-# Function definitions
-########################
-
-function print_usage {
-        echo "Usage: $(basename $0) [host:port]" 2>&1
+set -o pipefail
+# shellcheck source=lib/tls.sh
+source "$(dirname -- "${BASH_SOURCE[0]}")/../lib/tls.sh" || exit 1
+export LC_ALL=C
+tls_args "$@"
+for dep in sed tr; do
+    command -v "$dep" >/dev/null || tls_error "missing dependency: $dep"
+done
+tls_fetch
+subject=$(openssl x509 -in "$TLS_WORK/peer" -noout -subject \
+    -nameopt sep_multiline,sname,esc_2253,esc_ctrl,esc_msb,utf8) || tls_error 'cannot parse certificate subject'
+# OpenSSL escapes literal plus signs; only the spaced RDN separator is split.
+cn=$(printf '%s\n' "$subject" | sed 's/ + /\n/g' | sed -n 's/^ *CN *= *//p') || tls_error 'cannot parse certificate CN'
+issuer=$(openssl x509 -in "$TLS_WORK/peer" -noout -issuer -nameopt RFC2253) || tls_error 'cannot parse certificate issuer'
+expires=$(openssl x509 -in "$TLS_WORK/peer" -noout -enddate) || tls_error 'cannot parse certificate expiry'
+san=$(openssl x509 -in "$TLS_WORK/peer" -noout -ext subjectAltName 2>"$TLS_WORK/parse-errors") || {
+    cat "$TLS_WORK/parse-errors" >&2
+    tls_error 'cannot parse certificate SANs'
 }
-
-
-########################
-# Main Program
-########################
-if [[ ${#} -eq 0 ]]; then
-   print_usage
-   EXIT_CODE=1
-   exit ${EXIT_CODE}
-fi
-
-hostport=$1
-
-host=$(echo $1 | awk -F":" '{ print $1 }')
-port=$(echo $1 | awk -F":" '{ print $2 }')
-
-if [ "${port}" == "" ]
-then
-  port=${DEFAULT_PORT}
-fi
-
-echo "Host: ${host}"
-echo "Port: ${port}"
-echo "--"
-cert=$(true | openssl s_client -connect ${host}:${port} -showcerts 2>&1 | openssl x509 -noout -text)
-cn=$(echo "${cert}" | grep "Subject: CN" | awk -F"=" '{ print $2 }' | sed -e 's/^[ \t]*//')
-san=$(echo "${cert}" | grep DNS: | tr ',' '\n' | awk -F":" '{ print $2 }')
-expires=$(echo "${cert}" | grep "Not After" | awk -F":" '{ print $2 ":" $3 ":" $4}' | sed -e 's/^[ \t]*//')
-issuer=$(echo "${cert}" | grep "Issuer:" | sed -e 's/Issuer://' | sed -e 's/^[ \t]*//')
-
-echo "CN: ${cn}"
-echo "Issuer: ${issuer}"
-echo
-echo "Expires: ${expires}"
-echo
-echo "SAN(s):"
-echo "${san}"
-
-exit ${EXIT_CODE}
+san=$(printf '%s\n' "$san" | tr ',' '\n' | sed -n -e 's/^ *DNS:/DNS:/p' -e 's/^ *IP Address:/IP:/p') || tls_error 'cannot parse certificate SANs'
+printf 'Host: %s\nPort: %s\n--\n' "$TLS_HOST" "$TLS_PORT"
+printf 'CN: %s\nIssuer: %s\n\nExpires: %s\n\nSAN(s):\n%s\n' \
+    "${cn:-(none)}" "${issuer#issuer=}" "${expires#notAfter=}" "${san:-(none)}"

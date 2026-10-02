@@ -1,55 +1,108 @@
 #!/bin/bash
-# Kubernetes Disk Free - kdf
+# Inspect PVC filesystems in the selected (or current-context) namespace.
+set -uo pipefail
 
-pv_disk_free () {
-  pvc=$1
-
-  if [[ -z "${pvc}" ]]; then
-    echo "ERROR: no pvc specified, exiting..."
-    exit 1
-  fi
-  
-  kubectl get pvc ${pvc} > /dev/null 2>&1
-  if [[ $? -ne 0 ]]; then
-    echo "ERROR: no pvc with name ${pvc} found, exiting..."
-    exit 1
-  fi
-
-  pod=$(kubectl get pod -o json | jq -r "
-    .items[] |
-    select(.spec.volumes[]?.persistentVolumeClaim.claimName==\"${pvc}\") |
-            .metadata.name" | head -1)
-  if [ -z "${pod}" ]; then
-    echo "WARNING: No pods found"
-  else
-    volname=$(kubectl get pod ${pod} -o json | jq -r "
-      .spec.volumes[] |
-      select(.persistentVolumeClaim.claimName==\"${pvc}\") |
-      .name")
-    
-    mntpath=$(kubectl get pod ${pod} -o json | jq -r "
-      .spec.containers[].volumeMounts[] |
-      select(.name==\"${volname}\") |
-      .mountPath")
-    
-    kubectl exec ${pod} -- df -h ${mntpath}
-  fi
+usage() {
+    printf '%s\n' 'Usage: kdf [-n NAMESPACE|--namespace NAMESPACE] [-c CONTAINER|--container CONTAINER] [--pod POD] [PVC]' \
+        'Without PVC, inspect all PVCs in the selected or current-context namespace.' \
+        'Multiple mounted pods/containers require explicit selectors. All paths in the selected container are inspected.' \
+        'Requires: bash, kubectl, jq; df supporting -h and -- inside the container.' \
+        'Exit status: 0 success, 1 operational failure, 2 usage error.'
 }
-
-if [[ -n $1 ]]; then
-  pv_disk_free $1
-else
-  pvc_list=$(kubectl get pvc --no-headers | awk '{ print $1 }')
-
-  if [[ $? -ne 0 ]]; then
-    echo "ERROR: no pvcs found, exiting..."
-    exit 1
-  fi
-
-  for cur_pvc in ${pvc_list}
-  do
-    echo "${cur_pvc}: "
-    pv_disk_free $cur_pvc
-    echo
-  done
+usage_error() { printf 'kdf: %s\n' "$*" >&2; usage >&2; exit 2; }
+valid_name() { [[ $1 =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]]; }
+namespace=()
+pvc=''
+selected_pod=''
+selected_container=''
+while (($#)); do
+    case "$1" in
+        -h|--help) usage; exit 0 ;;
+        -n|--namespace|-c|--container|--pod)
+            if (($# < 2)) || ! valid_name "$2"; then
+                usage_error "$1 requires a resource name"
+            fi
+            case "$1" in
+                -n|--namespace)
+                    ((${#namespace[@]} == 0)) || usage_error 'namespace specified twice'
+                    namespace=(-n "$2") ;;
+                -c|--container)
+                    [[ -z $selected_container ]] || usage_error 'container specified twice'
+                    selected_container=$2 ;;
+                --pod)
+                    [[ -z $selected_pod ]] || usage_error 'pod specified twice'
+                    selected_pod=$2 ;;
+            esac
+            shift 2 ;;
+        --) shift; break ;;
+        -*) usage_error "unknown option: $1" ;;
+        *)
+            if [[ -n $pvc ]] || ! valid_name "$1"; then
+                usage_error 'expected at most one PVC name'
+            fi
+            pvc=$1; shift ;;
+    esac
+done
+if (($#)); then
+    if (($# != 1)) || [[ -n $pvc ]] || ! valid_name "$1"; then
+        usage_error 'expected at most one PVC name'
+    fi
+    pvc=$1
 fi
+for dependency in kubectl jq; do
+    command -v "$dependency" >/dev/null 2>&1 || {
+        printf 'kdf: required command not found: %s\n' "$dependency" >&2
+        exit 1
+    }
+done
+pvcs=$(kubectl "${namespace[@]}" get pvc -o json) || exit 1
+jq -e 'type == "object" and ((.items // []) | type == "array")' <<< "$pvcs" >/dev/null || {
+    printf 'kdf: invalid JSON resource list\n' >&2
+    exit 1
+}
+names=$(jq -r --arg pvc "$pvc" '[(.items // [])[] | .metadata.name | select($pvc == "" or . == $pvc)] | unique[]' <<< "$pvcs") || exit 1
+if [[ -z $names ]]; then
+    if [[ -n $pvc ]]; then
+        printf 'kdf: PVC %s not found in selected namespace\n' "$pvc" >&2
+        exit 1
+    fi
+    printf 'No PVCs in selected namespace.\n'
+    exit 0
+fi
+pods=$(kubectl "${namespace[@]}" get pods -o json) || exit 1
+jq -e 'type == "object" and ((.items // []) | type == "array")' <<< "$pods" >/dev/null || {
+    printf 'kdf: invalid JSON resource list\n' >&2
+    exit 1
+}
+while IFS= read -r name; do
+    [[ -n $name ]] || continue
+    selection=$(jq -c --arg pvc "$name" '
+        [(.items // [])[] as $pod |
+         $pod.spec.volumes[]? | select(.persistentVolumeClaim.claimName == $pvc) | .name as $volume |
+         ($pod.spec.containers // [])[] as $container |
+         $container.volumeMounts[]? | select(.name == $volume) |
+         {pod: $pod.metadata.name, container: $container.name, path: .mountPath}]' <<< "$pods") || exit 1
+    selection=$(jq -c --arg pod "$selected_pod" '[.[] | select($pod == "" or .pod == $pod)]' <<< "$selection") || exit 1
+    count=$(jq '[.[].pod] | unique | length' <<< "$selection") || exit 1
+    if ((count != 1)); then
+        printf 'kdf: %s: expected one mounted pod, found %s; use --pod NAME\n' "$name" "$count" >&2
+        exit 1
+    fi
+    selection=$(jq -c --arg container "$selected_container" '[.[] | select($container == "" or .container == $container)]' <<< "$selection") || exit 1
+    count=$(jq '[.[].container] | unique | length' <<< "$selection") || exit 1
+    if ((count != 1)); then
+        printf 'kdf: %s: expected one mounted container, found %s; use --container NAME\n' "$name" "$count" >&2
+        exit 1
+    fi
+    pod=$(jq -r '.[0].pod' <<< "$selection") || exit 1
+    container=$(jq -r '.[0].container' <<< "$selection") || exit 1
+    paths_json=$(jq -ce '[.[].path] | unique |
+        if all(.[]; type == "string" and startswith("/") and (contains("\u0000") | not))
+        then . else error("invalid mount path") end' <<< "$selection") || exit 1
+    paths=()
+    while IFS= read -r -d '' path; do
+        paths+=("$path")
+    done < <(jq -j '.[] | ., "\u0000"' <<< "$paths_json")
+    printf '%s:\n' "$name"
+    kubectl "${namespace[@]}" exec "$pod" -c "$container" -- df -h -- "${paths[@]}" || exit 1
+done <<< "$names"

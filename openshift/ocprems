@@ -1,15 +1,51 @@
 #!/bin/bash
+# Cluster-wide API removal report, fetched in one snapshot.
+set -uo pipefail
 
-REMOVEDAPISFULL=$(oc get apirequestcounts -o jsonpath='{range .items[?(@.status.removedInRelease!="")]}{.status.removedInRelease}{"\t"}{.status.requestCount}{"\t"}{.metadata.name}{"\n"}{end}')
+usage() {
+    printf '%s\n' 'Usage: ocprems [-h|--help]' \
+        'Report cluster-wide APIRequestCounts with a removal release and their last-24h callers.' \
+        'Requires: bash, oc, jq and cluster-scoped list access to apirequestcounts.apiserver.openshift.io.' \
+        'Exit status: 0 success, 1 operational failure, 2 usage error.'
+}
+if (($#)); then
+    if (($# == 1)) && [[ $1 == -h || $1 == --help ]]; then
+        usage
+        exit 0
+    fi
+    printf 'ocprems: unexpected arguments\n' >&2
+    usage >&2
+    exit 2
+fi
 
-REMOVEDAPIS=$(echo "${REMOVEDAPISFULL}" | awk '{ print $NF }' | tr '\n' ' ')
-
-for api in ${REMOVEDAPIS}
-do
-  echo "${api}"
-  echo "==============="
-  oc get apirequestcounts ${api} -o jsonpath='{range .status.last24h..byUser[*]}{..byVerb[*].verb}{","}{.username}{","}{.userAgent}{"\n"}{end}'   | sort -k 2 -t, -u | column -t -s ","
-  echo "==============="
-  echo
+for dependency in oc jq; do
+    command -v "$dependency" >/dev/null 2>&1 || {
+        printf 'ocprems: required command not found: %s\n' "$dependency" >&2
+        exit 1
+    }
 done
-
+data=$(oc get apirequestcounts -o json) || exit 1
+jq -e 'type == "object" and ((.items // []) | type == "array")' <<< "$data" >/dev/null || {
+    printf 'ocprems: invalid JSON resource list\n' >&2
+    exit 1
+}
+report=$(jq -r '
+    [(.items // [])[] | select((.status.removedInRelease // "") != "")]
+    | if length == 0 then "No APIs with a reported removal release."
+      else sort_by(.metadata.name)[]
+        | "API: \(.metadata.name // "unknown")",
+          "Removed in release: \(.status.removedInRelease)",
+          "Request count: \(.status.requestCount // "unknown")",
+          "Last 24h callers (distinct user/verb/user-agent):",
+          "USER\tVERB\tUSER AGENT",
+          ([ (.status.last24h // [])[] | (.byNode // [])[] | (.byUser // [])[] |
+             . as $user | (.byVerb // []) |
+             (if length == 0 then [{verb: "unknown"}] else . end)[] |
+             [$user.username // "unknown", .verb // "unknown", $user.userAgent // "unknown"] ]
+           | unique | if length == 0 then "(no caller data)" else .[] | @tsv end),
+          ""
+      end
+' <<< "$data") || exit 1
+printf '%s\n' "$report"
+[[ $report != 'No APIs with a reported removal release.' ]] && printf '\n'
+exit 0
