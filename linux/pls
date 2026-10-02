@@ -1,37 +1,36 @@
 #!/bin/bash
 
-container_count=0
-declare -a containers_unsorted
-declare -a containers_sorted
-
-# Collect ps output for further processing
-ps_out="$(ps -eo pid,user:20,args | grep [c]onmon)"
-
-# Bail out if there's no conmon process
-if [ $? -ne 0 ]
-then
-  exit 99
+usage() {
+  printf '%s\n' 'Usage: pls [-h|--help]' \
+    'List visible conmon container names as owner:name, sorted.' \
+    'ps flattens argv: names containing option-like text are ambiguous.'
+}
+if [[ $# == 1 && ($1 == -h || $1 == --help) ]]; then
+  usage
+  exit 0
+fi
+if (( $# )); then
+  usage >&2
+  exit 2
 fi
 
-# Read ps output into array
-readarray -t CONMONS <<< $(echo "${ps_out}")
-
-# Wade through output and collect what is needed
-for conmon in "${CONMONS[@]}"
-do
-  user=$(echo "${conmon}" | awk '{ print $2 }')
-  container=$(echo "${conmon}" | grep -oh "[[:space:]]-n[[:space:]][[:alnum:][:punct:]]*" | awk '{ print $2 }')
-  containers_unsorted+=("${user}:${container}")
-done
-
-# Sort array
-readarray -t containers_sorted < <(for a in "${containers_unsorted[@]}"; do echo "$a"; done | sort)
-
-
-containercount=${#containers_sorted[@]}
-
-# Print running podman containers
-for cont in "${containers_sorted[@]}"
-do
-  echo $cont
-done
+export LC_ALL=C
+set -o pipefail
+ps_out=$(ps -ww -eo user:32=,comm=,args=) || exit 1
+{
+  while read -r owner comm args; do
+    [[ $comm == conmon ]] || continue
+    executable=${args%%[[:space:]]*}
+    [[ ${executable##*/} == conmon ]] || continue
+    # Never eval process arguments. Match a complete option, not a substring.
+    if [[ $args =~ [[:space:]](-n[[:space:]]+|--name[[:space:]]+|--name=)(.*) ]]; then
+      name=${BASH_REMATCH[2]}
+      # Keep spaces up to the next option (ps does not retain argv boundaries).
+      name=${name%%[[:space:]]-*}
+      name=${name%"${name##*[!$'\t ']}"}
+      if [[ -n $name && $name != -* ]]; then
+        printf '%s:%s\n' "$owner" "$name"
+      fi
+    fi
+  done <<< "$ps_out"
+} | sort || exit 1

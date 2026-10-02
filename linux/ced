@@ -1,53 +1,31 @@
 #!/bin/bash
-# Certificate Expiration Date (ced) Checker
-
-# Configure to your liking
-REDWHENLESSTHANDAYS=30
-YELLOWWHENLESSTHANDAYS=90
-DIFFCMD="/usr/bin/datediff"
-
-# Terminal colors
-red=$(tput setaf 1)
-green=$(tput setaf 2)
-yellow=$(tput setaf 3)
-reset=$(tput sgr0)
-COLOR=${reset}
-
-# Simply check if 1 argument has been given. No more sanity checks done
-if [ -z "$1" ]
-then
-  echo "please enter host:port as argument"
+# Certificate Expiration Date: inspection only, not trust validation.
+# shellcheck source=lib/tls.sh
+source "$(dirname -- "${BASH_SOURCE[0]}")/../lib/tls.sh" || exit 1
+export LC_ALL=C
+tls_args "$@"
+command -v date >/dev/null || tls_error 'missing dependency: GNU date'
+tls_fetch
+expires=$(openssl x509 -in "$TLS_WORK/peer" -noout -enddate) || tls_error 'cannot parse certificate expiry'
+expires=${expires#notAfter=}
+end=$(date -u -d "$expires" +%s) || tls_error 'cannot convert expiry (GNU date required)'
+now=$(date -u +%s) || tls_error 'cannot read current time'
+# Floor, not truncation: any expired certificate has a negative day count.
+seconds=$((end - now))
+if ((seconds < 0)); then
+    days=$(((seconds - 86399) / 86400))
 else
-  # If we have no colon, assume :443
-  if [[ ! "${1}" =~ :[0-9]+$ ]];
-  then
-    TARGET="${1}:443"
-  else
-    TARGET="${1}"
-  fi
-
-  DATES=$(echo | openssl s_client -connect ${TARGET} 2>/dev/null | openssl x509 -noout -dates)
-  DATE_START=$(echo $DATES | grep notBefore | awk -F"=" '{ print $NF }')
-  DATE_END=$(echo $DATES | grep notAfter | awk -F"=" '{ print $NF }')
-  
-  
-  if [ -x "${DIFFCMD}" ]
-  then
-    DAYS_TO_END=$(${DIFFCMD} -i "%b %d %H:%M:%S %Y %Z" -f "%d" now "${DATE_END}")
-    COLOR="${green}"
-  
-    if [ ${DAYS_TO_END} -lt ${YELLOWWHENLESSTHANDAYS} ]
-    then
-      COLOR=${yellow}
-    fi
-  
-    if [ ${DAYS_TO_END} -lt ${REDWHENLESSTHANDAYS} ]
-    then
-      COLOR=${red}
-    fi
-  
-  fi
-  
-  echo "EXPIRES: ${COLOR}${DATE_END}${reset}" 
-  
+    days=$((seconds / 86400))
 fi
+color='' reset=''
+if [[ -t 1 && ! ${NO_COLOR+x} && -n ${TERM:-} && ${TERM:-} != dumb ]] && command -v tput >/dev/null; then
+    index=2
+    ((days < 90)) && index=3
+    ((days < 30)) && index=1
+    if color=$(tput setaf "$index" 2>/dev/null) && reset=$(tput sgr0 2>/dev/null); then
+        :
+    else
+        color='' reset=''
+    fi
+fi
+printf 'EXPIRES: %s%s%s\nDAYS REMAINING: %s\n' "$color" "$expires" "$reset" "$days"

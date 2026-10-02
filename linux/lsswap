@@ -1,14 +1,55 @@
 #!/bin/bash
 
-printf "%-14s %-14s %-20s\n" "SWAP(MB)" "PID" "PROCESS"
-for file in /proc/*/status
-do
-  PID=$(awk '/^Pid:/{ printf $2 }' ${file})
-  PROC=$(awk '/Name:/{ printf $2 }' ${file})
-  SWAP=$(awk '/VmSwap:/{ printf $2/1024 }' ${file})
+usage() {
+  printf '%s\n' 'Usage: lsswap [--limit N] | -h | --help' \
+    'Show processes using the most swap, in MiB (default limit: 10; N must be positive).' \
+    'PROC_ROOT overrides /proc for fixtures or another mounted proc filesystem.'
+}
+if [[ $# == 1 && ($1 == -h || $1 == --help) ]]; then
+  usage
+  exit 0
+fi
+limit=10
+if [[ $# == 2 && $1 == --limit && $2 =~ ^[0-9]+$ && $2 =~ [1-9] ]]; then
+  limit=$2
+elif (( $# )); then
+  usage >&2
+  exit 2
+fi
 
-  if [ -n "${SWAP}" ]
-  then
-    printf "%-14.2f %-14d %-20s\n" ${SWAP} ${PID} ${PROC}
-  fi
-done | sort -k 1 -n -r | head -10
+export LC_ALL=C
+set -o pipefail
+proc_root=${PROC_ROOT:-/proc}
+if [[ ! -d $proc_root || ! -r $proc_root || ! -x $proc_root ]]; then
+  printf 'lsswap: cannot read proc root: %s\n' "$proc_root" >&2
+  exit 1
+fi
+{
+  for file in "$proc_root"/[0-9]*/status; do
+    [[ -r $file ]] || continue
+    pid='' name='' swap=''
+    # Open and parse each status only once. Processes may disappear at any time.
+    {
+      while IFS=: read -r key value; do
+        if [[ $key == Name ]]; then
+          name=${value#$'\t'}
+          continue
+        fi
+        value=${value#"${value%%[!$'\t ']*}"}
+        case $key in
+          Pid) pid=$value ;;
+          VmSwap) swap=${value%%[[:space:]]*} ;;
+        esac
+      done < "$file"
+    } 2>/dev/null || continue
+    [[ $pid =~ ^[0-9]+$ && $swap =~ ^[0-9]+$ && -n $name ]] || continue
+    printf '%s\t%s\t%s\n' "$swap" "$pid" "$name"
+  done
+} | sort -t $'\t' -k1,1nr -k2,2n | awk -v limit="$limit" '
+  BEGIN { printf "%-14s %-14s %s\n", "SWAP(MiB)", "PID", "PROCESS" }
+  NR <= limit {
+    swap=$1; pid=$2
+    sub(/^[^\t]*\t[^\t]*\t/, "")
+    printf "%-14.2f %-14s %s\n", swap/1024, pid, $0
+  }
+' || exit 1
