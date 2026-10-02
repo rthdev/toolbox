@@ -1,0 +1,712 @@
+#!/usr/bin/env python3
+"""
+ocptool.py
+
+Extensible capacity management tool for OpenShift Container Platform.
+
+Requirements:
+- oc CLI configured and logged in
+- Python 3.8+
+
+Optional dependencies:
+- tabulate (pip install tabulate)
+
+Author: Several...
+"""
+
+import argparse
+import json
+import subprocess
+import sys
+from collections import defaultdict
+from typing import Dict, List
+
+try:
+    from tabulate import tabulate
+except ImportError:
+    print("Missing dependency: tabulate (pip install tabulate)")
+    sys.exit(1)
+
+# ==========================
+# Configuration
+# ==========================
+
+DEFAULT_WARNING_THRESHOLD = 0.60
+WARNING_COLOR = "\033[91m"
+RESET_COLOR = "\033[0m"
+
+NODE_ROLE_PRIORITY = [
+    ("control", ["node-role.kubernetes.io/control-plane", "node-role.kubernetes.io/master"]),
+    ("infra", ["node-role.kubernetes.io/infra"]),
+    ("worker", ["node-role.kubernetes.io/worker"]),
+]
+
+# ==========================
+# Utility Functions
+# ==========================
+
+def run_oc(cmd: List[str]) -> str:
+    """Run an oc command and return stdout."""
+    result = subprocess.run(
+        ["oc"] + cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip())
+    return result.stdout
+
+
+def parse_quantity(value: str) -> float:
+    """
+    Parse Kubernetes resource quantities into base units:
+    - CPU -> cores
+    - Memory -> MiB
+    """
+    if not value or value in ("<none>", "0"):
+        return 0.0
+
+    value = value.strip()
+
+    # CPU
+    if value.endswith("m"):
+        return float(value[:-1]) / 1000
+
+    # Memory (binary)
+    if value.endswith("Ki"):
+        return float(value[:-2]) / 1024
+    if value.endswith("Mi"):
+        return float(value[:-2])
+    if value.endswith("Gi"):
+        return float(value[:-2]) * 1024
+    
+    # Memory (decimal)
+    if value.endswith("K"):
+        return float(value[:-1]) / 1024
+    if value.endswith("M"):
+        return float(value[:-1]) * 1000 / 1024
+    if value.endswith("G"):
+        return float(value[:-1]) * 1000 + 1000 / 1024 / 1024
+
+    # Plain number (CPU cores)
+    return float(value)
+
+
+def colorize(value: float, total: float, threshold: float = DEFAULT_WARNING_THRESHOLD) -> str:
+    """Colorize values exceeding threshold."""
+    if total == 0:
+        return f"{value:.2f}"
+    if value / total >= threshold:
+        return f"{WARNING_COLOR}{value:.2f}{RESET_COLOR}"
+    return f"{value:.2f}"
+
+
+def detect_node_role(labels: dict) -> str:
+    """
+    Determine node type based on label priority
+    """
+    for role, label_keys in NODE_ROLE_PRIORITY:
+        if any(k in labels for k in label_keys):
+            return role
+    return "worker"
+
+
+def clean_quantity(token: str) -> str:
+    """
+
+    """
+    return token.split("(")[0].strip()
+
+
+def node_requests_limits() -> Dict[str, Dict[str, float]]:
+    """
+    Parse `oc describe node` output and extract scheduler-accurate
+    CPU/MEM requests and limits.
+    """
+    output = run_oc(["describe", "nodes"])
+    nodes = {}
+
+    current_node = None
+    in_allocated = False
+
+    for line in output.splitlines():
+        if line.startswith("Name:"):
+            current_node = line.split(":", 1)[1].strip()
+            nodes[current_node] = {
+                "CPU_REQUEST": 0.0,
+                "MEM_REQUEST": 0.0,
+                "CPU_LIMIT": 0.0,
+                "MEM_LIMIT": 0.0,
+            }
+            in_allocated = False
+            continue
+
+        if line.strip().startswith("Allocated resources:"):
+            in_allocated = True
+            continue
+
+        if not in_allocated or not current_node:
+            continue
+
+        # Skip headers and separators
+        if line.strip().startswith(("Resource", "--------")):
+            continue
+
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+
+        resource = parts[0]
+
+        # Requests and limits may span multiple tokens, percentages included
+        request_raw = clean_quantity(parts[1])
+        limit_raw = clean_quantity(parts[3]) if len(parts) > 2 else "0"
+
+        try:
+            if resource == "cpu":
+                nodes[current_node]["CPU_REQUEST"] = parse_quantity(request_raw)
+                nodes[current_node]["CPU_LIMIT"] = parse_quantity(limit_raw)
+
+            elif resource == "memory":
+                nodes[current_node]["MEM_REQUEST"] = parse_quantity(request_raw)
+                nodes[current_node]["MEM_LIMIT"] = parse_quantity(limit_raw)
+
+        except ValueError:
+            # Defensive: never crash capacity reporting
+            continue
+
+    return nodes
+
+
+
+# ==========================
+# Data Collection Layer
+# ==========================
+
+class OpenShiftData:
+    """Encapsulates all oc data retrieval."""
+
+    @staticmethod
+    def nodes() -> Dict:
+        return json.loads(run_oc(["get", "nodes", "-o", "json"]))
+
+    @staticmethod
+    def pods(namespace=None, all_namespaces=False):
+        cmd = ["get", "pods", "-o", "json"]
+
+        if all_namespaces:
+            cmd.extend(["-A"])
+        elif namespace:
+            cmd.extend(["-n", namespace])
+
+        return json.loads(run_oc(cmd))
+
+    @staticmethod
+    def top_nodes() -> Dict[str, Dict]:
+        """
+        Returns usage data from `oc adm top nodes`
+        """
+        output = run_oc(["adm", "top", "nodes"])
+        usage = {}
+        lines = output.splitlines()[1:]
+        for line in lines:
+            fields = line.split()
+            usage[fields[0]] = {
+                "cpu": parse_quantity(fields[1]),
+                "memory": parse_quantity(fields[3]),
+            }
+        return usage
+
+
+    @staticmethod
+    def top_pods(namespace=None, all_namespaces=False):
+        """
+        Safely parse `oc adm top pods` output.
+        Handles:
+        - with / without namespace column
+        - missing memory column
+        - variable formatting
+        """
+        cmd = ["adm", "top", "pods"]
+
+        if all_namespaces:
+            cmd.extend(["-A"])
+        elif namespace:
+            cmd.extend(["-n", namespace])
+
+        output = run_oc(cmd)
+        lines = output.splitlines()
+    
+        if len(lines) < 2:
+            return {}
+    
+        header = lines[0].lower().split()
+    
+        # Determine column positions dynamically
+        col_map = {}
+        for idx, col in enumerate(header):
+            if col == "namespace":
+                col_map["namespace"] = idx
+            elif col == "name":
+                col_map["name"] = idx
+            elif "cpu" in col:
+                col_map["cpu"] = idx
+            elif "memory" in col:
+                col_map["memory"] = idx
+    
+        usage = {}
+    
+        for line in lines[1:]:
+            fields = line.split()
+            if len(fields) <= col_map.get("name", 0):
+                continue
+    
+            ns = fields[col_map["namespace"]] if "namespace" in col_map else namespace
+            pod_name = fields[col_map["name"]]
+    
+            cpu = 0.0
+            mem = 0.0
+    
+            if "cpu" in col_map and len(fields) > col_map["cpu"]:
+                cpu = parse_quantity(fields[col_map["cpu"]])
+    
+            if "memory" in col_map and len(fields) > col_map["memory"]:
+                mem = parse_quantity(fields[col_map["memory"]])
+    
+            usage[ns, pod_name] = {
+                "cpu": cpu,
+                "memory": mem,
+            }
+            #print(pod_name + ': ' + str(usage[pod_name]["memory"])) # debug
+    
+        return usage
+
+
+
+# ==========================
+# Action Base Class
+# ==========================
+
+class Action:
+    name = None
+
+    def run(self, args):
+        raise NotImplementedError
+
+
+# ==========================
+# Action: capacity
+# ==========================
+
+class CapacityAction(Action):
+    name = "capacity"
+
+    def run(self, args):
+        nodes = OpenShiftData.nodes()
+        usage = OpenShiftData.top_nodes()
+
+        node_rl    = node_requests_limits()
+        grouped    = defaultdict(list)
+
+
+        for node in nodes["items"]:
+            node_name = node["metadata"]["name"]
+            labels = node["metadata"].get("labels", {})
+
+            node_role = detect_node_role(labels)
+
+            if args.node_role and node_role != args.node_role:
+              continue
+
+            alloc = node["status"]["allocatable"]
+            grouped[node_role].append({
+                "NODE"       : node_name,
+                "CPU_ALLOC"  : parse_quantity(alloc["cpu"]),
+                "MEM_ALLOC"  : parse_quantity(alloc["memory"]),
+                "CPU_REQUEST": node_rl.get(node_name, {}).get("CPU_REQUEST", 0.0),
+                "MEM_REQUEST": node_rl.get(node_name, {}).get("MEM_REQUEST", 0.0),
+                "CPU_LIMIT"  : node_rl.get(node_name, {}).get("CPU_LIMIT", 0.0),
+                "MEM_LIMIT"  : node_rl.get(node_name, {}).get("MEM_LIMIT", 0.0),
+                "CPU_USAGE"  : usage.get(node_name, {}).get("cpu", 0),
+                "MEM_USAGE"  : usage.get(node_name, {}).get("memory", 0),
+            })
+
+        for node_role, rows in grouped.items():
+            rows.sort(key=lambda x: x["NODE"])
+            print(f"\nNode Role: {node_role.upper()}")
+            self.print_table(rows)
+
+
+    def print_table(self, rows):
+        totals = defaultdict(float)
+        for row in rows:
+            for k, v in row.items():
+                if k != "NODE":
+                    totals[k] += v
+
+        table = []
+        for r in rows:
+            table.append([
+                r["NODE"],
+                f'{r["CPU_ALLOC"]:.2f}',
+                f'{r["MEM_ALLOC"]:.0f}',
+                colorize(r["CPU_REQUEST"], r["CPU_ALLOC"]),
+                colorize(r["MEM_REQUEST"], r["MEM_ALLOC"]),
+                colorize(r["CPU_LIMIT"], r["CPU_ALLOC"]),
+                colorize(r["MEM_LIMIT"], r["MEM_ALLOC"]),
+                colorize(r["CPU_USAGE"], r["CPU_ALLOC"]),
+                colorize(r["MEM_USAGE"], r["MEM_ALLOC"]),
+            ])
+
+        table.append("-")
+
+        total_row = [
+            "TOTAL",
+            f'{totals["CPU_ALLOC"]:.2f}',
+            f'{totals["MEM_ALLOC"]:.0f}',
+            colorize(totals["CPU_REQUEST"], totals["CPU_ALLOC"]),
+            colorize(totals["MEM_REQUEST"], totals["MEM_ALLOC"]),
+            colorize(totals["CPU_LIMIT"], totals["CPU_ALLOC"]),
+            colorize(totals["MEM_LIMIT"], totals["MEM_ALLOC"]),
+            colorize(totals["CPU_USAGE"], totals["CPU_ALLOC"]),
+            colorize(totals["MEM_USAGE"], totals["MEM_ALLOC"]),
+        ]
+
+        print(tabulate(
+            table + [total_row],
+            headers=[
+                "NODE",
+                "CPU_ALLOC",
+                "MEM_ALLOC(Mi)",
+                "CPU_REQUEST",
+                "MEM_REQUEST(Mi)",
+                "CPU_LIMIT",
+                "MEM_LIMIT(Mi)",
+                "CPU_USAGE",
+                "MEM_USAGE(Mi)",
+            ],
+            tablefmt="github"
+        ))
+
+# ==========================
+# Action: nstop
+# ==========================
+
+
+
+class NamespaceTopAction(Action):
+    name = "nstop"
+
+    COLUMNS = [
+        "POD",
+        "NODE",
+        "CPU_REQUEST",
+        "MEM_REQUEST",
+        "CPU_LIMIT",
+        "MEM_LIMIT",
+        "CPU_USAGE",
+        "MEM_USAGE",
+    ]
+
+    def run(self, args):
+        pods = OpenShiftData.pods(namespace=args.namespace)
+        usage = OpenShiftData.top_pods(namespace=args.namespace)
+
+        rows = []
+
+        for pod in pods.get("items", []):
+            ns = pod["metadata"]["namespace"]
+            pod_name = pod["metadata"]["name"]
+            node = pod["spec"].get("nodeName", "N/A")
+
+            cpu_req = mem_req = cpu_lim = mem_lim = 0.0
+
+            for c in pod["spec"].get("containers", []):
+                res = c.get("resources", {})
+                cpu_req += parse_quantity(res.get("requests", {}).get("cpu", "0"))
+                mem_req += parse_quantity(res.get("requests", {}).get("memory", "0"))
+                cpu_lim += parse_quantity(res.get("limits", {}).get("cpu", "0"))
+                mem_lim += parse_quantity(res.get("limits", {}).get("memory", "0"))
+
+            rows.append({
+                "POD": pod_name,
+                "NODE": node,
+                "CPU_REQUEST": cpu_req,
+                "MEM_REQUEST": mem_req,
+                "CPU_LIMIT": cpu_lim,
+                "MEM_LIMIT": mem_lim,
+                "CPU_USAGE": usage.get((ns, pod_name), {}).get("cpu", 0.0),
+                "MEM_USAGE": usage.get((ns, pod_name), {}).get("memory", 0.0),
+            })
+
+        if not rows:
+            print("No pods found.")
+            return
+
+        sort_key = args.sort_by or "CPU_REQUEST"
+        if sort_key not in self.COLUMNS:
+            raise ValueError(f"Invalid sort key: {sort_key}")
+
+        rows.sort(key=lambda r: r[sort_key], reverse=True)
+
+        totals = defaultdict(float)
+        for row in rows:
+            for k, v in row.items():
+                if k != "POD":
+                    if k != "NODE":
+                        totals[k] += v
+
+        table = []
+        for r in rows:
+            table.append([
+                r["POD"],
+                r["NODE"],
+                f"{r['CPU_REQUEST']:.2f}",
+                f"{r['MEM_REQUEST']:.0f}",
+                f"{r['CPU_LIMIT']:.2f}",
+                f"{r['MEM_LIMIT']:.0f}",
+                f"{r['CPU_USAGE']:.2f}",
+                f"{r['MEM_USAGE']:.0f}",
+            ])
+
+        table.append("-")
+
+        total_row = [
+            "TOTAL",
+            "",
+            totals["CPU_REQUEST"],
+            totals["MEM_REQUEST"],
+            totals["CPU_LIMIT"],
+            totals["MEM_LIMIT"],
+            totals["CPU_USAGE"],
+            totals["MEM_USAGE"],
+        ]
+
+        print(tabulate(
+            table + [total_row],
+            headers=self.COLUMNS,
+            tablefmt="github"
+        ))
+
+# ==========================
+# Action: ptop
+# ==========================
+
+class PodTopClusterAction(Action):
+    name = "ptop"
+
+    COLUMNS = [
+        "NAMESPACE",
+        "POD",
+        "NODE",
+        "CPU_REQUEST",
+        "MEM_REQUEST",
+        "CPU_LIMIT",
+        "MEM_LIMIT",
+        "CPU_USAGE",
+        "MEM_USAGE",
+    ]
+
+    def run(self, args):
+        pods = OpenShiftData.pods(all_namespaces=True)          # all namespaces
+        usage = OpenShiftData.top_pods(all_namespaces=True)     # cluster-wide pod usage
+        nodes = OpenShiftData.nodes()
+
+        # Build node -> role map (priority-aware)
+        node_roles = {}
+        for node in nodes.get("items", []):
+            name = node["metadata"]["name"]
+            labels = node["metadata"].get("labels", {})
+            node_roles[name] = detect_node_role(labels)
+
+        rows = []
+
+        for pod in pods.get("items", []):
+            ns = pod["metadata"]["namespace"]
+            pod_name = pod["metadata"]["name"]
+            namespace = pod["metadata"]["namespace"]
+            node = pod["spec"].get("nodeName")
+
+            if not node:
+                continue
+
+            # Apply node-role filter
+            if args.node_role:
+                if node_roles.get(node) != args.node_role:
+                    continue
+
+            cpu_req = mem_req = cpu_lim = mem_lim = 0.0
+
+            for c in pod["spec"].get("containers", []):
+                res = c.get("resources", {})
+                cpu_req += parse_quantity(res.get("requests", {}).get("cpu", "0"))
+                mem_req += parse_quantity(res.get("requests", {}).get("memory", "0"))
+                cpu_lim += parse_quantity(res.get("limits", {}).get("cpu", "0"))
+                mem_lim += parse_quantity(res.get("limits", {}).get("memory", "0"))
+
+            rows.append({
+                "NAMESPACE": namespace,
+                "POD": pod_name,
+                "NODE": node,
+                "CPU_REQUEST": cpu_req,
+                "MEM_REQUEST": mem_req,
+                "CPU_LIMIT": cpu_lim,
+                "MEM_LIMIT": mem_lim,
+                "CPU_USAGE": usage.get((ns, pod_name), {}).get("cpu", 0.0),
+                "MEM_USAGE": usage.get((ns, pod_name), {}).get("memory", 0.0),
+            })
+
+        if not rows:
+            print("No pods found.")
+            return
+
+        sort_key = args.sort_by or "CPU_REQUEST"
+        if sort_key not in self.COLUMNS:
+            raise ValueError(f"Invalid sort key: {sort_key}")
+
+        rows.sort(key=lambda r: r[sort_key], reverse=True)
+
+        limit = args.limit or 20
+        rows = rows[:limit]
+
+        table = []
+        for r in rows:
+            table.append([
+                r["NAMESPACE"],
+                r["POD"],
+                r["NODE"],
+                f"{r['CPU_REQUEST']:.2f}",
+                f"{r['MEM_REQUEST']:.0f}",
+                f"{r['CPU_LIMIT']:.2f}",
+                f"{r['MEM_LIMIT']:.0f}",
+                f"{r['CPU_USAGE']:.2f}",
+                f"{r['MEM_USAGE']:.0f}",
+            ])
+
+        print(tabulate(
+            table,
+            headers=self.COLUMNS,
+            tablefmt="github"
+        ))
+
+
+
+# ==========================
+# Action: free
+# ==========================
+class FreeCapacityAction(Action):
+    name = "free"
+
+    def run(self, args):
+        nodes = OpenShiftData.nodes()
+        rl = node_requests_limits()
+
+        grouped = defaultdict(list)
+
+        for n in nodes["items"]:
+            name = n["metadata"]["name"]
+            labels = n["metadata"].get("labels", {})
+            role = detect_node_role(labels)
+
+            if args.node_role and role != args.node_role:
+                continue
+
+            alloc = n["status"]["allocatable"]
+
+            grouped[role].append({
+                "NODE": name,
+                "CPU_ALLOC": parse_quantity(alloc["cpu"]),
+                "MEM_ALLOC": parse_quantity(alloc["memory"]),
+                "CPU_REQUEST": rl.get(name, {}).get("CPU_REQUEST", 0.0),
+                "MEM_REQUEST": rl.get(name, {}).get("MEM_REQUEST", 0.0),
+            })
+
+        if not grouped:
+            print("No matching nodes found.")
+            return
+
+        for role, rows in grouped.items():
+            print(f"\nNode role: {role.upper()} (N-1 safe)")
+
+            total_cpu_alloc = sum(r["CPU_ALLOC"] for r in rows)
+            total_mem_alloc = sum(r["MEM_ALLOC"] for r in rows)
+
+            total_cpu_req = sum(r["CPU_REQUEST"] for r in rows)
+            total_mem_req = sum(r["MEM_REQUEST"] for r in rows)
+
+            max_cpu_node = max(rows, key=lambda r: r["CPU_ALLOC"])
+            max_mem_node = max(rows, key=lambda r: r["MEM_ALLOC"])
+
+            eff_cpu = total_cpu_alloc - max_cpu_node["CPU_ALLOC"]
+            eff_mem = total_mem_alloc - max_mem_node["MEM_ALLOC"]
+
+            free_cpu = eff_cpu - total_cpu_req
+            free_mem = eff_mem - total_mem_req
+
+            table = [[
+                role,
+                f"{total_cpu_alloc:.2f}",
+                f"{total_cpu_req:.2f}",
+                f"{eff_cpu:.2f}",
+                f"{free_cpu:.2f}",
+                f"{total_mem_alloc:.0f}",
+                f"{total_mem_req:.0f}",
+                f"{eff_mem:.0f}",
+                f"{free_mem:.0f}",
+                max_cpu_node["NODE"],
+                max_mem_node["NODE"],
+            ]]
+
+            print(tabulate(
+                table,
+                headers=[
+                    "ROLE",
+                    "CPU_ALLOC",
+                    "CPU_REQUEST",
+                    "CPU_EFF(N-1)",
+                    "CPU_FREE",
+                    "MEM_ALLOC",
+                    "MEM_REQUEST",
+                    "MEM_EFF(N-1)",
+                    "MEM_FREE",
+                    "WORST_CPU_NODE",
+                    "WORST_MEM_NODE",
+                ],
+                tablefmt="github"
+            ))
+
+
+
+
+# ==========================
+# Action Registry
+# ==========================
+
+ACTIONS = {
+    CapacityAction.name: CapacityAction(),
+    NamespaceTopAction.name: NamespaceTopAction(),
+    PodTopClusterAction.name: PodTopClusterAction(),
+    FreeCapacityAction.name: FreeCapacityAction(),
+    }
+
+
+# ==========================
+# CLI
+# ==========================
+
+def main():
+    parser = argparse.ArgumentParser(description="OpenShift Capacity Management Tool")
+    parser.add_argument("action", nargs="?", default="capacity", choices=ACTIONS.keys())
+    parser.add_argument("--node-role", choices=["control", "infra", "worker"])
+    parser.add_argument("--label", help="node label filter (key=value)")
+    parser.add_argument("--limit", type=int, default=20)
+    parser.add_argument("-n", "--namespace")
+    parser.add_argument("--sort-by", help="column to sort by")
+
+    args = parser.parse_args()
+    ACTIONS[args.action].run(args)
+
+
+if __name__ == "__main__":
+    main()
