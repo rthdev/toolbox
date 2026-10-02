@@ -80,16 +80,4 @@ New scripts should:
 - Document required permissions and the scope of any changes.
 - Request confirmation for destructive actions where practical.
 
-## Contributing
-
-Fixes, improvements, and new helpers are welcome.
-
-Keep contributions focused and include:
-
-- A brief explanation of the problem the script solves.
-- Usage examples and required dependencies.
-- Testing details, including relevant Linux or OpenShift versions.
-- Any known limitations or operational risks.
-<!-- Add a LICENSE file and replace this section with your chosen license. -->
-
 A license has not yet been selected.
