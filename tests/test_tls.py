@@ -60,6 +60,30 @@ exec "$REAL_OPENSSL" "$@"
         self.env['TLS_CERT'] = str(cert)
         return cert, key
 
+    def assert_standalone(self, tool):
+        self.certificate()
+        install = self.path / 'standalone tools'
+        install.mkdir()
+        copied = install / tool
+        shutil.copy2(ROOT / 'linux' / tool, copied)
+        # No sibling scripts/lib tree, and the working directory is unrelated.
+        for args, status in ((('--help',), 0), (('first.test', '--', 'second.test'), 2),
+                             (('example.test',), 0)):
+            result = subprocess.run([str(copied), *args], cwd=self.path,
+                                    env=self.env, text=True, capture_output=True, timeout=8)
+            self.assertEqual(result.returncode, status, result.stderr)
+            if args == ('example.test',):
+                self.assertEqual(result.stderr, '')
+                expected = 'CN: example.test' if tool == 'certinfo' else 'EXPIRES:'
+                self.assertIn(expected, result.stdout)
+        self.assertEqual(list(self.path.glob('tls.*')), [])
+
+    def test_ced_standalone_copy(self):
+        self.assert_standalone('ced')
+
+    def test_certinfo_standalone_copy(self):
+        self.assert_standalone('certinfo')
+
     def test_certificate_metadata(self):
         cert, _ = self.certificate()
         expected_expiry = subprocess.check_output(

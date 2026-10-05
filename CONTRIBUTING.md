@@ -3,6 +3,11 @@
 Keep changes small and focused. Preserve existing executable names unless a migration
 has been agreed. The repository intentionally contains extensionless commands.
 
+Keep small Bash tools self-contained and independently copyable. Prefer modest
+duplication over shared libraries that introduce a checkout-layout dependency.
+Reserve shared libraries for larger scripts or Python where the complexity
+justifies them, not merely to deduplicate a few shell helpers.
+
 ## Branch and pull request workflow
 
 Never commit or push directly to `main`, including through GitHub's file-editing API.
@@ -56,8 +61,8 @@ Tests must use isolated temporary directories and must not modify user configura
 ## Checks and boundaries
 
 - `make syntax`: Bash parsing and a non-executing Python AST check of `ocptool`.
-- `make lint`: ShellCheck on explicit extensionless Bash command paths/shared shell
-  helpers, Ruff on the new Python tests only.
+- `make lint`: ShellCheck on explicit extensionless Bash command paths,
+  Ruff on the new Python tests only.
 - `make test`: Python stdlib unittest discovery, including real local TLS fixtures.
 - `make check`: all of the above. No blanket suppression of lint errors.
 

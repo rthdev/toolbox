@@ -13,9 +13,9 @@ the packages in `requirements-dev.txt`. OpenSSL 1.1.1+ and jq 1.6+ are the inten
 minimums; CI exercises the distributions shipped with Ubuntu 24.04, not every
 historical dependency version. Use supported vendor versions for production.
 
-Keep the checkout layout intact; `ced` and `certinfo` source `lib/tls.sh`. No
-installation into system directories is necessary. Examples below assume the
-repository root as the working directory.
+The Bash commands are self-contained and can be copied individually; no repository
+layout or shared library is required. Install their external runtime dependencies.
+Examples below assume the repository root as the working directory.
 
 ## `certinfo`: certificate details
 
@@ -37,7 +37,7 @@ IPv6 SANs retain the complete address; OpenSSL may expand and capitalise their
 representation. Other SAN types (such as URI/email) are not included. Subject
 values use OpenSSL escaping rather than unsafe shell interpretation.
 
-Dependencies: OpenSSL, GNU `timeout`, `mktemp`, `dirname`, `cat`, `rm`, `sed`, `tr`.
+Dependencies: OpenSSL, GNU `timeout`, `mktemp`, `cat`, `rm`, `sed`, `tr`.
 Connection or certificate parsing failures return 1 without a partial result table.
 Temporary transport files are removed when the command finishes.
 
@@ -61,8 +61,8 @@ change the success exit code: this is a report, not a monitoring-threshold API.
 
 On suitable terminals, less than 30 days is red, less than 90 yellow, otherwise
 green. Redirected output, `TERM=dumb`, an unset/empty `TERM`, or any set `NO_COLOR`
-disables colors. `tput` is optional. Dependencies are the TLS helper's core tools,
-OpenSSL and GNU `date`; no trust or hostname validation is performed.
+disables colors. `tput` is optional. Dependencies are OpenSSL, GNU `timeout`,
+`mktemp`, `cat`, `rm` and GNU `date`; no trust or hostname validation is performed.
 
 ## `gkc`: validate Kustomize builds
 

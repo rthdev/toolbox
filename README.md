@@ -29,8 +29,9 @@ cd toolbox
 ./linux/lsswap
 ```
 
-Keep the repository layout intact: the certificate commands use the shared TLS
-helper under `lib/`. Run the executable directly or with its interpreter:
+The Bash commands are self-contained: copy an individual command to your preferred
+location once its external dependencies are installed. No sibling scripts or shared
+libraries are required. Run the executable directly or with its interpreter:
 
 ```bash
 bash linux/certinfo example.com:443
@@ -46,7 +47,6 @@ there is no repository-wide runtime package installation.
 ```text
 linux/                 Linux and certificate commands
 openshift/             Cluster commands
-lib/                   Shared TLS helper
 docs/commands.md       Command reference and operational limits
 tests/                 Offline regression tests and loopback TLS integration
 .github/workflows/     Pull-request validation
