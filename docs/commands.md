@@ -112,11 +112,18 @@ Lists **all PVCs** in the specified namespace or the current kubeconfig context'
 namespace; it never scans all namespaces or switches context. There are no PVC,
 pod or container selectors.
 
-Prints one pipe-delimited table with this header:
+Prints one whitespace-aligned table with these eight columns, in normal `df` style:
 
 ```text
-PVC Name | Pod Name | Filesystem | Size | Used | Avail | Mounted on
+PVC Name  Pod Name  Filesystem  Size  Used  Avail  Use%  Mounted on
 ```
+
+Size, Used, Avail and Use% are right-aligned; the other columns are left-aligned.
+Column widths include the header and all successful or blank rows. The table is
+buffered until all mounts have been inspected, while diagnostics are written
+immediately to stderr. Use% is copied from `df`, not recalculated from rounded
+human-readable sizes. Spaces and literal pipes in filesystem and mount paths
+are preserved; pipes are not column separators.
 
 Fetches PVCs and pods once each, matches actual PVC-backed volume names to regular
 container mounts, and reports every matching **Running pod** and mount path.

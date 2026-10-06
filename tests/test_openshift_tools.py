@@ -68,13 +68,65 @@ print(value if isinstance(value, str) else json.dumps(value))
 
 
 
+    def test_kdf_preserves_reported_percentage_instead_of_recomputing(self):
+        self.data["exec"] = "Filesystem Size Used Avail Use% Mounted on\n/dev/disk 10G 3G 7G 37% /data space"
+        result = self.run_tool("kdf")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_kdf_table(result.stdout,
+                              [["data", "worker", "/dev/disk", "10G", "3G", "7G", "37%", "/data space"]])
+
+    def assert_kdf_table(self, output, rows):
+        """Check field padding directly without tokenizing filesystem or mount paths."""
+        header = ["PVC Name", "Pod Name", "Filesystem", "Size", "Used", "Avail", "Use%", "Mounted on"]
+        table = [header] + rows
+        widths = [max(len(row[column]) for row in table) for column in range(8)]
+        expected = []
+        for row in table:
+            fields = [value.rjust(widths[column]) if 3 <= column <= 6 else value.ljust(widths[column])
+                      for column, value in enumerate(row)]
+            expected.append("  ".join(fields))
+        self.assertEqual(output, "\n".join(expected) + "\n")
+
+    def test_kdf_columns_align_across_header_long_rows_and_blank_claims(self):
+        blank = "zzz-unmounted-claim-longer-than-mounted"
+        self.data["pvc"]["items"].extend([
+            {"metadata": {"name": "long-mounted-claim"}}, {"metadata": {"name": blank}}])
+        pod = self.pod("worker-with-a-long-name")
+        pod["spec"]["volumes"][0]["persistentVolumeClaim"]["claimName"] = "long-mounted-claim"
+        self.data["pods"]["items"].append(pod)
+        self.data["exec"] = ("Filesystem Size Used Avail Use% Mounted on\n"
+                             "/dev/disk 10G 3G 7G 30% /data\n"
+                             "server:/long-filesystem-name 123456G 23456G 100000G 19% /long mount path\n"
+                             "/dev/full 1G 1G 0G 100% /full\n"
+                             "/dev/empty 1G 0G 1G 0% /empty")
+        result = self.run_tool("kdf")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        expected = []
+        for pvc, pod_name in (("data", "worker"), ("long-mounted-claim", "worker-with-a-long-name")):
+            expected.extend([
+                [pvc, pod_name, "/dev/disk", "10G", "3G", "7G", "30%", "/data"],
+                [pvc, pod_name, "server:/long-filesystem-name", "123456G", "23456G", "100000G", "19%", "/long mount path"],
+                [pvc, pod_name, "/dev/full", "1G", "1G", "0G", "100%", "/full"],
+                [pvc, pod_name, "/dev/empty", "1G", "0G", "1G", "0%", "/empty"]])
+        expected.append([blank, "", "", "", "", "", "", ""])
+        self.assert_kdf_table(result.stdout, expected)
+
+    def test_kdf_padding_preserves_pipes_in_filesystem_and_mountpoint(self):
+        filesystem = "server:/fs | name"
+        mount = "/mount | with  spaces"
+        self.data["exec"] = f"Filesystem Size Used Avail Use% Mounted on\n{filesystem} 10G 3G 7G 30% {mount}"
+        result = self.run_tool("kdf")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_kdf_table(result.stdout,
+                              [["data", "worker", filesystem, "10G", "3G", "7G", "30%", mount]])
+
     def test_kdf_namespace_report_includes_unmounted_claims(self):
         self.data["pvc"]["items"].append({"metadata": {"name": "unused"}})
         result = self.run_tool("kdf")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "PVC Name | Pod Name | Filesystem | Size | Used | Avail | Mounted on\n"
-                         "data | worker | /dev/disk | 10G | 3G | 7G | /data space\n"
-                         "unused |  |  |  |  |  | \n")
+        self.assert_kdf_table(result.stdout, [
+            ["data", "worker", "/dev/disk", "10G", "3G", "7G", "30%", "/data space"],
+            ["unused", "", "", "", "", "", "", ""]])
         self.assertEqual(self.calls, [
             ["get", "pvc", "-o", "json"], ["get", "pods", "-o", "json"],
             ["exec", "worker", "-c", "app", "--", "df", "-P", "-h", "--", "/data space"]])
@@ -94,14 +146,14 @@ print(value if isinstance(value, str) else json.dumps(value))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual([call[1:4] for call in self.calls if "exec" in call],
                          [["other", "-c", "app"], ["worker", "-c", "sidecar"], ["worker", "-c", "sidecar"]])
-        self.assertEqual(result.stdout.count("PVC Name |"), 1)
+        self.assertEqual(result.stdout.count("PVC Name"), 1)
         self.assertEqual(len(result.stdout.splitlines()), 4)
 
     def test_kdf_block_claim_has_only_blank_row(self):
         self.data["pvc"]["items"][0]["spec"] = {"volumeMode": "Block"}
         result = self.run_tool("kdf")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.splitlines()[1], "data |  |  |  |  |  | ")
+        self.assert_kdf_table(result.stdout, [["data", "", "", "", "", "", "", ""]])
         self.assertEqual(len(self.calls), 2)
 
     def test_kdf_namespace_and_cli_validation(self):
@@ -134,7 +186,7 @@ print(value if isinstance(value, str) else json.dumps(value))
             self.data["pods"] = pods
             result = self.run_tool("kdf")
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(result.stdout.splitlines()[1], "data |  |  |  |  |  | ")
+            self.assert_kdf_table(result.stdout, [["data", "", "", "", "", "", "", ""]])
             self.assertEqual(len(self.calls), 2)
 
     def test_kdf_invalid_mount_paths_fail_without_exec(self):
@@ -163,8 +215,8 @@ print(value if isinstance(value, str) else json.dumps(value))
         result = self.run_tool("kdf")
         self.assertEqual(result.returncode, 1)
         self.assertIn("df failed in pod aaa", result.stderr)
-        self.assertIn("data | zzz | /dev/disk", result.stdout)
-        self.assertNotIn("data | aaa", result.stdout)
+        self.assert_kdf_table(result.stdout,
+                              [["data", "zzz", "/dev/disk", "10G", "3G", "7G", "30%", "/data space"]])
         self.assertEqual(len(self.calls), 4)
         self.data.pop("fail_exec_pods")
         for output in ("", "Filesystem Size Used Avail Use% Mounted on", "not df output"):
@@ -179,22 +231,23 @@ print(value if isinstance(value, str) else json.dumps(value))
         self.data["exec"] = "Filesystem Size Used Avail Capacity Mounted on\nserver:/fs name   1.5T 512G 1T 34% /mount with  spaces"
         result = self.run_tool("kdf")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.splitlines()[1],
-                         "data | worker | server:/fs name | 1.5T | 512G | 1T | /mount with  spaces")
+        self.assert_kdf_table(result.stdout,
+                              [["data", "worker", "server:/fs name", "1.5T", "512G", "1T", "34%", "/mount with  spaces"]])
 
     def test_kdf_large_namespace_snapshot_uses_no_argv_payload(self):
         self.data["pods"]["items"][0]["metadata"]["annotations"] = {"large": "x" * 150000}
         result = self.run_tool("kdf")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("data | worker | /dev/disk", result.stdout)
+        self.assert_kdf_table(result.stdout,
+                              [["data", "worker", "/dev/disk", "10G", "3G", "7G", "30%", "/data space"]])
         self.assertEqual(len(self.calls), 3)
 
     def test_kdf_numeric_text_in_mountpoint_is_not_usage(self):
         self.data["exec"] = "Filesystem Size Used Avail Use% Mounted on\n/dev/disk 10G 3G 7G 30% /mount 1G 2G 3G 4% /tail"
         result = self.run_tool("kdf")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.splitlines()[1],
-                         "data | worker | /dev/disk | 10G | 3G | 7G | /mount 1G 2G 3G 4% /tail")
+        self.assert_kdf_table(result.stdout,
+                              [["data", "worker", "/dev/disk", "10G", "3G", "7G", "30%", "/mount 1G 2G 3G 4% /tail"]])
 
     def test_kdf_distinct_claims_match_volume_names_not_claim_names(self):
         self.data["pvc"]["items"].append({"metadata": {"name": "aaa"}})
@@ -203,8 +256,9 @@ print(value if isinstance(value, str) else json.dumps(value))
         self.data["pods"]["items"].append(other)
         result = self.run_tool("kdf")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual([line.split(" | ")[:2] for line in result.stdout.splitlines()[1:]],
-                         [["aaa", "aaa-worker"], ["data", "worker"]])
+        self.assert_kdf_table(result.stdout, [
+            ["aaa", "aaa-worker", "/dev/disk", "10G", "3G", "7G", "30%", "/data space"],
+            ["data", "worker", "/dev/disk", "10G", "3G", "7G", "30%", "/data space"]])
         self.assertEqual(len(self.calls), 4)
 
     def test_kdf_nonrunning_pods_and_nonregular_mounts_get_blank_rows(self):
@@ -212,7 +266,7 @@ print(value if isinstance(value, str) else json.dumps(value))
             self.data["pods"]["items"][0]["status"]["phase"] = phase
             result = self.run_tool("kdf")
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(result.stdout.splitlines()[1], "data |  |  |  |  |  | ")
+            self.assert_kdf_table(result.stdout, [["data", "", "", "", "", "", "", ""]])
             self.assertEqual(len(self.calls), 2)
         pod = self.pod()
         pod["spec"]["initContainers"] = pod["spec"]["containers"]
@@ -222,7 +276,7 @@ print(value if isinstance(value, str) else json.dumps(value))
         self.data["pods"]["items"] = [pod]
         result = self.run_tool("kdf")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.splitlines()[1], "data |  |  |  |  |  | ")
+        self.assert_kdf_table(result.stdout, [["data", "", "", "", "", "", "", ""]])
         self.assertEqual(len(self.calls), 2)
 
     def test_ocprems_retains_distinct_callers_with_one_fetch(self):

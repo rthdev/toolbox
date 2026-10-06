@@ -53,7 +53,8 @@ rows=$(printf '%s\n%s\n' "$pvcs" "$pods" | jq -cs '
     unique_by([.pod, .path]) |
     if length == 0 then [{pvc: $pvc, pod: "", container: "", path: ""}] else . end |
     .[]') || exit 1
-printf '%s\n' 'PVC Name | Pod Name | Filesystem | Size | Used | Avail | Mounted on'
+# Keep structured rows until every column width is known (paths may contain |).
+table=('["PVC Name", "Pod Name", "Filesystem", "Size", "Used", "Avail", "Use%", "Mounted on"]')
 status=0
 while IFS= read -r row; do
     [[ -n $row ]] || continue
@@ -62,7 +63,8 @@ while IFS= read -r row; do
         jq -j '[.pvc, .pod, .container, .path][] | ., "\u0000"' <<< "$row")
     pvc=${fields[0]} pod=${fields[1]} container=${fields[2]} path=${fields[3]}
     if [[ -z $pod ]]; then
-        printf '%s |  |  |  |  |  | \n' "$pvc"
+        report=$(jq -cn --arg pvc "$pvc" '[$pvc, "", "", "", "", "", "", ""]') || exit 1
+        table+=("$report")
         continue
     fi
     if ! output=$(kubectl "${namespace[@]}" exec "$pod" -c "$container" -- df -P -h -- "$path"); then
@@ -71,17 +73,24 @@ while IFS= read -r row; do
         continue
     fi
     # Match the first numeric column group, preserving spaces in mountpoints.
-    report=$(jq -Rr --arg pvc "$pvc" --arg pod "$pod" '
+    report=$(jq -Rc --arg pvc "$pvc" --arg pod "$pod" '
         def number: "[0-9]+(?:[.][0-9]+)?[A-Za-z]*";
         capture("^(?<filesystem>.+?)\\s+(?<size>" + number + ")\\s+(?<used>" + number +
-            ")\\s+(?<avail>-?" + number + ")\\s+[0-9]+%\\s+(?<mount>.+)$") |
-        [$pvc, $pod, .filesystem, .size, .used, .avail, .mount] | join(" | ")
+            ")\\s+(?<avail>-?" + number + ")\\s+(?<use>[0-9]+%)\\s+(?<mount>.+)$") |
+        [$pvc, $pod, .filesystem, .size, .used, .avail, .use, .mount]
         ' <<< "$output") || { status=1; continue; }
     if [[ -n $report ]]; then
-        printf '%s\n' "$report"
+        table+=("$report")
     else
         printf 'kdf: %s: invalid df output in pod %s at %s\n' "$pvc" "$pod" "$path" >&2
         status=1
     fi
 done <<< "$rows"
+printf '%s\n' "${table[@]}" | jq -sr '
+    (transpose | map(map(length) | max)) as $widths |
+    .[] | to_entries | map(
+        (" " * ($widths[.key] - (.value | length))) as $padding |
+        if .key >= 3 and .key <= 6 then $padding + .value else .value + $padding end) |
+    join("  ")
+' || status=1
 exit "$status"
