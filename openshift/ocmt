@@ -1,0 +1,441 @@
+#!/usr/bin/env python3
+"""OpenShift Capacity Management Tool: read-only CPU/memory snapshot reports."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import re
+import subprocess
+import sys
+from decimal import Decimal, DecimalException
+
+WARNING_THRESHOLD = 0.60
+WARNING_COLOR = "\033[91m"
+RESET_COLOR = "\033[0m"
+
+RESOURCE_COLUMNS = [
+    "CPU_REQUEST",
+    "MEM_REQUEST",
+    "CPU_LIMIT",
+    "MEM_LIMIT",
+    "CPU_USAGE",
+    "MEM_USAGE",
+]
+QUANTITY = re.compile(
+    r"([+]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+))([eE][+-]?[0-9]+|[numkKMGTPE]|[KMGTPE]i)?"
+)
+SCALES = {"": Decimal(1), "n": Decimal("1e-9"), "u": Decimal("1e-6"), "m": Decimal("1e-3")}
+SCALES.update({suffix: Decimal(1000) ** power for power, suffix in enumerate("kMGTPE", 1)})
+SCALES.update({suffix + "i": Decimal(1024) ** power for power, suffix in enumerate("KMGTPE", 1)})
+SCALES["K"] = SCALES["k"]
+
+
+def quantity(value, resource):
+    """Convert a Kubernetes quantity to cores or MiB, never guessing the resource."""
+    match = QUANTITY.fullmatch(str(value))
+    if not match:
+        raise ValueError(f"invalid {resource} quantity: {value!r}")
+    number, suffix = match.groups()
+    suffix = suffix or ""
+    try:
+        if re.fullmatch(r"[eE][+-]?[0-9]+", suffix):
+            scale = Decimal("1" + suffix)
+        else:
+            scale = SCALES[suffix]
+        result = float(Decimal(number) * scale / (1048576 if resource == "memory" else 1))
+    except DecimalException as error:
+        raise ValueError(f"out-of-range {resource} quantity: {value!r}") from error
+    if not math.isfinite(result):
+        raise ValueError(f"out-of-range {resource} quantity: {value!r}")
+    return result
+
+
+class CollectionError(Exception):
+    """A command failed or returned an unusable snapshot."""
+
+
+class Cluster:
+    """Collect snapshots with both server and wall-clock time bounds per oc call."""
+
+    def __init__(self, timeout):
+        self.timeout = timeout
+
+    def run(self, *arguments):
+        command = ["oc", f"--request-timeout={self.timeout}s", *arguments]
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=self.timeout)
+        except subprocess.TimeoutExpired as error:
+            raise CollectionError(
+                f"oc {' '.join(arguments)} timed out after {self.timeout}s"
+            ) from error
+        except OSError as error:
+            raise CollectionError(f"cannot execute oc: {error}") from error
+        if result.returncode:
+            message = result.stderr.strip() or f"exit status {result.returncode}"
+            raise CollectionError(f"oc {' '.join(arguments)}: {message}")
+        return result.stdout.strip()
+
+    def items(self, *arguments):
+        try:
+            data = json.loads(self.run(*arguments))
+        except ValueError as error:
+            raise CollectionError(f"oc {' '.join(arguments)}: invalid JSON") from error
+        if not isinstance(data, dict) or not isinstance(data.get("items"), list):
+            raise CollectionError(f"oc {' '.join(arguments)}: expected a JSON items list")
+        for item in data["items"]:
+            if not isinstance(item, dict) or not isinstance(item.get("metadata"), dict):
+                raise CollectionError("invalid resource metadata in oc response")
+            if not isinstance(item["metadata"].get("name"), str) or not item["metadata"]["name"]:
+                raise CollectionError("missing resource name in oc response")
+        return data["items"]
+
+    def metrics(self, path):
+        try:
+            return self.items("get", "--raw", path)
+        except CollectionError as error:
+            print(f"ocmt: metrics unavailable: {error}", file=sys.stderr)
+            return []
+
+
+def optional_object(parent, key):
+    """Absent or null optional API objects are empty; other values must be objects."""
+    value = parent.get(key)
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError(f"{key}: expected a JSON object")
+    return value
+
+
+def pod_resources(pod):
+    """Effective spec resources: steady state vs ordered init peaks, plus overhead.
+
+    Restartable init containers keep running during subsequent init and application
+    containers. Ephemeral containers do not reserve scheduler resources.
+    """
+    spec = pod["spec"]
+    pod_budget = optional_object(spec, "resources")
+    overhead = optional_object(spec, "overhead")
+    result = {}
+    for kind in ("requests", "limits"):
+        for resource, prefix in (("cpu", "CPU"), ("memory", "MEM")):
+
+            def amount(container):
+                resources = optional_object(container, "resources")
+                return quantity(optional_object(resources, kind).get(resource, "0"), resource)
+
+            application = sum(amount(container) for container in spec["containers"])
+            sidecars = init_peak = 0.0
+            for container in spec.get("initContainers") or []:
+                value = amount(container)
+                if container.get("restartPolicy") == "Always":
+                    sidecars += value
+                    init_peak = max(init_peak, sidecars)
+                else:
+                    init_peak = max(init_peak, sidecars + value)
+            effective = max(application + sidecars, init_peak)
+            budget = optional_object(pod_budget, kind)
+            if resource in budget:
+                effective = quantity(budget[resource], resource)
+            # Kubernetes adds overhead to limits only when a nonzero limit exists.
+            if kind == "requests" or effective > 0:
+                effective += quantity(overhead.get(resource, "0"), resource)
+            result[prefix + ("_REQUEST" if kind == "requests" else "_LIMIT")] = effective
+    return result
+
+
+def pod_usage(pod, metric):
+    """Unknown if any expected long-running container lacks a metric."""
+    containers = metric.get("containers") or []
+    measured = {container["name"] for container in containers}
+    expected = {container["name"] for container in pod["spec"]["containers"]}
+    expected.update(
+        container["name"]
+        for container in pod["spec"].get("initContainers") or []
+        if container.get("restartPolicy") == "Always"
+    )
+    if not expected.issubset(measured):
+        return {"CPU_USAGE": None, "MEM_USAGE": None}
+    return {
+        prefix + "_USAGE": complete_sum(
+            quantity(c["usage"][resource], resource) if resource in (c.get("usage") or {}) else None
+            for c in containers
+        )
+        for resource, prefix in (("cpu", "CPU"), ("memory", "MEM"))
+    }
+
+
+def complete_sum(values):
+    values = list(values)
+    return None if not values or any(value is None for value in values) else sum(values)
+
+
+def totals(rows, columns):
+    return {column: complete_sum(row[column] for row in rows) for column in columns}
+
+
+def display_value(value):
+    if value is None:
+        return "unknown"
+    return f"{value:.2f}" if isinstance(value, (float, int)) else str(value)
+
+
+def print_table(columns, rows, highlight=False):
+    headers = [column + "(Mi)" if column.startswith("MEM_") else column for column in columns]
+    values = [[display_value(row[column]) for column in columns] for row in rows]
+    widths = [max(len(row[index]) for row in [headers] + values) for index in range(len(columns))]
+    color = (
+        highlight
+        and sys.stdout.isatty()
+        and "NO_COLOR" not in os.environ
+        and os.environ.get("TERM", "") not in ("", "dumb")
+    )
+    for index, values_row in enumerate([headers] + values):
+        fields = []
+        for column, value, width in zip(columns, values_row, widths):
+            padding = " " * (width - len(value))
+            if color and index > 0 and column in RESOURCE_COLUMNS:
+                row = rows[index - 1]
+                allocatable = row[column[:3] + "_ALLOC"]
+                if (
+                    row[column] is not None
+                    and allocatable > 0
+                    and row[column] / allocatable >= WARNING_THRESHOLD
+                ):
+                    value = WARNING_COLOR + value + RESET_COLOR
+            fields.append(value + padding)
+        print("| " + " | ".join(fields) + " |")
+        if index == 0:
+            print("| " + " | ".join("-" * width for width in widths) + " |")
+
+
+def node_role(node):
+    labels = node["metadata"].get("labels") or {}
+    for role, names in (
+        ("control", ("control-plane", "master")),
+        ("infra", ("infra",)),
+        ("worker", ("worker",)),
+    ):
+        if any("node-role.kubernetes.io/" + name in labels for name in names):
+            return role
+    return "worker"
+
+
+def selected_nodes(args, cluster):
+    selector = [f"--selector={args.label}"] if args.label else []
+    nodes = cluster.items("get", "nodes", "-o", "json", *selector)
+    return {
+        node["metadata"]["name"]: node
+        for node in nodes
+        if not args.node_role or node_role(node) == args.node_role
+    }
+
+
+def namespace_name(value):
+    if len(value) > 63 or not re.fullmatch(r"[a-z0-9](?:[-a-z0-9]*[a-z0-9])?", value):
+        raise ValueError("namespace must be a DNS label of 1 to 63 lowercase characters")
+    return value
+
+
+def report_pods(args, cluster):
+    namespace = args.namespace
+    if args.action == "nstop" and not namespace:
+        namespace = (
+            cluster.run("config", "view", "--minify", "-o", "jsonpath={..namespace}") or "default"
+        )
+    if namespace is not None:
+        namespace_name(namespace)
+    scope = [f"--namespace={namespace}"] if namespace else ["-A"]
+    pods = cluster.items("get", "pods", "-o", "json", *scope)
+    path = f"namespaces/{namespace}/pods" if namespace else "pods"
+    usage = {
+        (item["metadata"]["namespace"], item["metadata"]["name"]): item
+        for item in cluster.metrics("/apis/metrics.k8s.io/v1beta1/" + path)
+    }
+    nodes = selected_nodes(args, cluster) if args.node_role or args.label else None
+    rows = []
+    for pod in pods:
+        metadata = pod["metadata"]
+        node = pod["spec"].get("nodeName")
+        if args.action == "ptop" and not node:
+            continue
+        if nodes is not None and node not in nodes:
+            continue
+        row = dict(NAMESPACE=metadata["namespace"], POD=metadata["name"], NODE=node or "N/A")
+        row.update(pod_resources(pod))
+        row.update(pod_usage(pod, usage.get((metadata["namespace"], metadata["name"]), {})))
+        rows.append(row)
+    if not rows:
+        print("No pods found.")
+        return
+    sort_key = args.sort_by or "CPU_REQUEST"
+    rows.sort(key=lambda row: (row["NAMESPACE"], row["POD"]))
+    known = [row for row in rows if row[sort_key] is not None]
+    unknown = [row for row in rows if row[sort_key] is None]
+    rows = sorted(known, key=lambda row: row[sort_key], reverse=True) + unknown
+    if args.action == "ptop":
+        print_table(["NAMESPACE", "POD", "NODE"] + RESOURCE_COLUMNS, rows[: args.limit])
+    else:
+        rows.append(dict(POD="TOTAL", NODE="", **totals(rows, RESOURCE_COLUMNS)))
+        print_table(["POD", "NODE"] + RESOURCE_COLUMNS, rows)
+
+
+def node_state(node):
+    ready = any(
+        condition.get("type") == "Ready" and condition.get("status") == "True"
+        for condition in node["status"].get("conditions") or []
+    )
+    state = "Ready" if ready else "NotReady"
+    if node.get("spec", {}).get("unschedulable"):
+        state += ",Cordoned"
+    return state
+
+
+def node_rows(args, cluster):
+    nodes = selected_nodes(args, cluster)
+    rows = {}
+    for name, node in nodes.items():
+        allocatable = node["status"]["allocatable"]
+        rows[name] = dict(
+            NODE=name,
+            STATE=node_state(node),
+            ROLE=node_role(node),
+            CPU_ALLOC=quantity(allocatable["cpu"], "cpu"),
+            MEM_ALLOC=quantity(allocatable["memory"], "memory"),
+            CPU_REQUEST=0.0,
+            MEM_REQUEST=0.0,
+            CPU_LIMIT=0.0,
+            MEM_LIMIT=0.0,
+        )
+    for pod in cluster.items("get", "pods", "-o", "json", "-A"):
+        name = pod["spec"].get("nodeName")
+        if name not in rows or pod.get("status", {}).get("phase") in ("Succeeded", "Failed"):
+            continue
+        for column, value in pod_resources(pod).items():
+            rows[name][column] += value
+    return rows
+
+
+def report_capacity(args, cluster):
+    rows = node_rows(args, cluster)
+    usage = {
+        item["metadata"]["name"]: item.get("usage") or {}
+        for item in cluster.metrics("/apis/metrics.k8s.io/v1beta1/nodes")
+    }
+    for name, row in rows.items():
+        for resource, prefix in (("cpu", "CPU"), ("memory", "MEM")):
+            value = usage.get(name, {}).get(resource)
+            row[prefix + "_USAGE"] = quantity(value, resource) if value is not None else None
+    if not rows:
+        print("No matching nodes found.")
+        return
+    columns = ["CPU_ALLOC", "MEM_ALLOC"] + RESOURCE_COLUMNS
+    for role in ("control", "infra", "worker"):
+        group = sorted(
+            (row for row in rows.values() if row["ROLE"] == role), key=lambda row: row["NODE"]
+        )
+        if group:
+            print(f"\nNode role: {role.upper()}")
+            group.append(dict(NODE="TOTAL", STATE="", **totals(group, columns)))
+            print_table(["NODE", "STATE"] + columns, group, highlight=True)
+
+
+def report_free(args, cluster):
+    rows = node_rows(args, cluster)
+    if not rows:
+        print("No matching nodes found.")
+        return
+    print("N-1 aggregate headroom: not a scheduling guarantee.")
+    print("Allocatable includes only Ready, uncordoned nodes; requests include all matching nodes.")
+    for role in ("control", "infra", "worker"):
+        group = sorted(
+            (row for row in rows.values() if row["ROLE"] == role), key=lambda row: row["NODE"]
+        )
+        if not group:
+            continue
+        available = [row for row in group if row["STATE"] == "Ready"]
+        result = {"ROLE": role}
+        for prefix in ("CPU", "MEM"):
+            allocatable = prefix + "_ALLOC"
+            worst = max(available, key=lambda row: row[allocatable], default=None)
+            result[allocatable] = sum(row[allocatable] for row in available)
+            result[prefix + "_REQUEST"] = sum(row[prefix + "_REQUEST"] for row in group)
+            effective = result[allocatable] - (worst[allocatable] if worst else 0)
+            result[prefix + "_EFF(N-1)"] = effective
+            result[prefix + "_FREE"] = effective - result[prefix + "_REQUEST"]
+            result["WORST_" + prefix + "_NODE"] = worst["NODE"] if worst else "none"
+        print_table(
+            [
+                "ROLE",
+                "CPU_ALLOC",
+                "CPU_REQUEST",
+                "CPU_EFF(N-1)",
+                "CPU_FREE",
+                "MEM_ALLOC",
+                "MEM_REQUEST",
+                "MEM_EFF(N-1)",
+                "MEM_FREE",
+                "WORST_CPU_NODE",
+                "WORST_MEM_NODE",
+            ],
+            [result],
+        )
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+    parser.add_argument(
+        "action", nargs="?", default="capacity", choices=["capacity", "nstop", "ptop", "free"]
+    )
+    parser.add_argument("-n", "--namespace")
+    parser.add_argument("--node-role", choices=["control", "infra", "worker"])
+    parser.add_argument("--label", help="node label selector, passed to oc")
+    parser.add_argument("--sort-by", choices=["NAMESPACE", "POD", "NODE"] + RESOURCE_COLUMNS)
+    parser.add_argument("--limit", type=int, help="ptop rows (positive integer; default: 20)")
+    parser.add_argument("--timeout", type=int, default=30, help="seconds per oc call (default: 30)")
+    args = parser.parse_args()
+    if not 1 <= args.timeout <= 3600:
+        parser.error("--timeout must be an integer from 1 to 3600")
+    if args.namespace is not None:
+        try:
+            namespace_name(args.namespace)
+        except ValueError as error:
+            parser.error(str(error))
+        if args.action not in ("nstop", "ptop"):
+            parser.error("--namespace is only valid for nstop and ptop")
+    if args.limit is not None and (args.limit < 1 or args.action != "ptop"):
+        parser.error("--limit is a positive integer for ptop only")
+    args.limit = args.limit or 20
+    if args.sort_by and (
+        args.action not in ("nstop", "ptop")
+        or (args.action == "nstop" and args.sort_by == "NAMESPACE")
+    ):
+        parser.error("--sort-by must name a column in the selected pod report")
+    if args.label is not None and (
+        not args.label.strip() or any(ord(c) < 32 or ord(c) == 127 for c in args.label)
+    ):
+        parser.error("--label must be a nonempty node selector without control characters")
+    return args
+
+
+def main():
+    args = parse_args()
+    try:
+        cluster = Cluster(args.timeout)
+        if args.action == "capacity":
+            report_capacity(args, cluster)
+        elif args.action == "free":
+            report_free(args, cluster)
+        else:
+            report_pods(args, cluster)
+    except (CollectionError, ValueError, KeyError, TypeError, AttributeError) as error:
+        print(f"ocmt: invalid or unavailable cluster data: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

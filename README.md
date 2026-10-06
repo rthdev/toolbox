@@ -13,6 +13,7 @@ Commands intentionally have no `.sh` or `.py` extension.
 | [`pls`](linux/pls) | Container owner/name hints from visible conmon processes | Bash, procps `ps`, text utilities |
 | [`kdf`](openshift/kdf) | Disk-free report for all PVCs and running pod mounts in a namespace | Bash, `kubectl`, jq, container `df` |
 | [`ocprems`](openshift/ocprems) | API-removal request counts and recent callers | Bash, `oc`, jq |
+| [`ocmt`](openshift/ocmt) | OpenShift Capacity Management Tool: node/pod resources and N-1 headroom | Python 3.9+ (standard library), `oc` |
 
 See the [command guide](docs/commands.md) for options, examples, dependencies,
 permissions, exit codes and limitations.
@@ -28,7 +29,8 @@ cd toolbox
 
 The Bash commands are self-contained: copy an individual command to your preferred
 location once its external dependencies are installed. No sibling scripts or shared
-libraries are required. Run the executable directly or with its interpreter:
+libraries are required. `ocmt` is also independently copyable and needs no Python
+packages. Run the executable directly or with its interpreter:
 
 ```bash
 bash linux/certinfo example.com:443
