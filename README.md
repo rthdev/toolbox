@@ -14,11 +14,9 @@ Commands intentionally have no `.sh` or `.py` extension.
 | [`pls`](linux/pls) | Container owner/name hints from visible conmon processes | Bash, procps `ps`, text utilities |
 | [`kdf`](openshift/kdf) | Inspect mounted PVC filesystem usage inside a selected container | Bash, `kubectl`, jq, container `df` |
 | [`ocprems`](openshift/ocprems) | API-removal request counts and recent callers | Bash, `oc`, jq |
-| [`ocptool`](openshift/ocptool) | OpenShift capacity and pod resource reports | Python 3.8+, `oc`, `tabulate` |
 
 See the [command guide](docs/commands.md) for options, examples, dependencies,
-permissions, exit codes and limitations. `ocptool` is unchanged by the current
-hardening work; its accounting and error handling require a separate review/fix.
+permissions, exit codes and limitations.
 
 ## Getting started
 
@@ -35,12 +33,10 @@ libraries are required. Run the executable directly or with its interpreter:
 
 ```bash
 bash linux/certinfo example.com:443
-python3 openshift/ocptool --help
 ```
 
-The first command makes a TLS connection. The Python command requires `tabulate`
-even for help. Install runtime dependencies appropriate to the commands you use;
-there is no repository-wide runtime package installation.
+This command makes a TLS connection. Install runtime dependencies appropriate to
+the commands you use; there is no repository-wide runtime package installation.
 
 ## Layout
 

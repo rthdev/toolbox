@@ -50,7 +50,7 @@ exec "$REAL_OPENSSL" "$@"
         return result
 
     def certificate(self, subject='/O=Fixture, Inc./OU=Testing/CN=example.test',
-                    san: str | None = 'DNS:example.test,DNS:alt.test,IP:192.0.2.7,IP:2001:db8::7'):
+                    san: str | None = 'DNS:example.test,DNS:alt.test,IP:192.0.2.7'):
         cert, key = self.path / 'cert.pem', self.path / 'key.pem'
         args = [self.openssl, 'req', '-x509', '-newkey', 'rsa:2048', '-nodes',
                 '-keyout', str(key), '-out', str(cert), '-days', '2', '-subj', subject]
@@ -95,7 +95,7 @@ exec "$REAL_OPENSSL" "$@"
         self.assertIn('Issuer: ', result.stdout)
         self.assertIn('Fixture', result.stdout)
         self.assertIn(f'Expires: {expected_expiry}\n', result.stdout)
-        for san in ('DNS:example.test', 'DNS:alt.test', 'IP:192.0.2.7', 'IP:2001:DB8:0:0:0:0:0:7'):
+        for san in ('DNS:example.test', 'DNS:alt.test', 'IP:192.0.2.7'):
             self.assertIn(san + '\n', result.stdout)
 
     def test_missing_parse_dependencies(self):
@@ -179,12 +179,11 @@ exec "$REAL_SED" "$@"
         self.assertIn('SAN(s):\n(none)\n', result.stdout)
 
     def test_ip_only_sans(self):
-        self.certificate(subject='/O=IP only', san='IP:192.0.2.7,IP:2001:db8::7')
-        result = self.run_tool('certinfo', '[::1]')
+        self.certificate(subject='/O=IP only', san='IP:192.0.2.7')
+        result = self.run_tool('certinfo', '192.0.2.7')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('CN: (none)\n', result.stdout)
         self.assertIn('IP:192.0.2.7\n', result.stdout)
-        self.assertIn('IP:2001:DB8:0:0:0:0:0:7\n', result.stdout)
 
     def test_ced_days_and_safe_color(self):
         self.certificate()
@@ -248,11 +247,11 @@ exec "$REAL_SED" "$@"
                 args = (self.path / 'args').read_text().splitlines()
                 self.assertEqual(args[args.index('-connect') + 1], 'example.test:443')
 
-    def test_invalid_ipv6_is_usage_error(self):
+    def test_unsupported_targets_rejected_before_transport(self):
         for tool in ('certinfo', 'ced'):
-            for address in ('[:::]', '[1:2:3]', '[1:2:3:4:5:6:7:8:9]',
-                            '[1::2::3]', '[12345::1]', '[::ffff:999.0.0.1]'):
+            for address in ('[::1]', '::1', '[2001:db8::1]:443'):
                 with self.subTest(tool=tool, address=address):
+                    (self.path / 'args').unlink(missing_ok=True)
                     result = self.run_tool(tool, address)
                     self.assertEqual(result.returncode, 2)
                     self.assertFalse((self.path / 'args').exists())
@@ -260,12 +259,7 @@ exec "$REAL_SED" "$@"
     def test_transport_address_and_sni(self):
         for tool in ('certinfo', 'ced'):
             for target, extra, connect, sni in (
-                ('[2001:db8::1]:8443', ['--servername', 'example.test'], '[2001:db8::1]:8443', 'example.test'),
-                ('[::1]', [], '[::1]:443', None),
-                ('[::]', [], '[::]:443', None),
-                ('[1:2:3:4:5:6:7:8]:65535', [], '[1:2:3:4:5:6:7:8]:65535', None),
-                ('[::ffff:192.0.2.7]', [], '[::ffff:192.0.2.7]:443', None),
-                ('[2001:db8::]', [], '[2001:db8::]:443', None),
+                ('192.0.2.7:8443', ['--servername', 'example.test'], '192.0.2.7:8443', 'example.test'),
                 ('127.0.0.1:00443', [], '127.0.0.1:443', None),
                 ('example.test', [], 'example.test:443', 'example.test'),
             ):
@@ -273,6 +267,7 @@ exec "$REAL_SED" "$@"
                     self.run_tool(tool, *extra, target)
                     args = (self.path / 'args').read_text().splitlines()
                     self.assertEqual(args[args.index('-connect') + 1], connect)
+                    self.assertIn('-4', args)
                     if sni:
                         self.assertEqual(args[args.index('-servername') + 1], sni)
                     else:

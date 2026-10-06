@@ -60,15 +60,11 @@ Tests must use isolated temporary directories and must not modify user configura
 
 ## Checks and boundaries
 
-- `make syntax`: Bash parsing and a non-executing Python AST check of `ocptool`.
+- `make syntax`: Bash syntax checks.
 - `make lint`: ShellCheck on explicit extensionless Bash command paths,
   Ruff on the new Python tests only.
 - `make test`: Python stdlib unittest discovery, including real local TLS fixtures.
 - `make check`: all of the above. No blanket suppression of lint errors.
-
-`openshift/ocptool` is deliberately excluded from the current hardening work and
-from new Python lint rules. Its syntax check does **not** validate its resource
-accounting or cluster behaviour; those need a separate change and test suite.
 
 Test failure and argument validation as well as happy paths. Use stdout for results,
 stderr for errors, and document dependencies, scope, permissions and exit codes.

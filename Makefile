@@ -7,7 +7,6 @@ check: syntax lint test
 
 syntax:
 	@for file in $(SHELL_FILES); do bash -n "$$file" || exit; done
-	$(PYTHON) -c 'import ast, pathlib; ast.parse(pathlib.Path("openshift/ocptool").read_text())'
 
 lint:
 	shellcheck $(SHELL_FILES)

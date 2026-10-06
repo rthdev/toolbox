@@ -2,10 +2,9 @@
 
 ## Common conventions
 
-The seven Bash commands use **0** for success/help, **1** for operational failure,
-and **2** for invalid usage. Results go to stdout, diagnostics to stderr. `-h` and
-`--help` display usage without connecting to a server or cluster. These conventions
-do not describe the unchanged Python `ocptool`.
+Use **0** for success/help, **1** for operational failure, and **2** for invalid
+usage. Write results to stdout and diagnostics to stderr. `-h` and `--help`
+should display usage without connecting to a server or cluster.
 
 Runtime baseline: Linux, Bash 4.4+, GNU coreutils/findutils and the command-specific
 dependencies below. Development checks additionally require Python 3.9+, Make and
@@ -22,20 +21,20 @@ Examples below assume the repository root as the working directory.
 ```bash
 ./linux/certinfo example.com
 ./linux/certinfo --timeout 5 example.com:8443
-./linux/certinfo --servername example.com '[2001:db8::1]:443'
+./linux/certinfo --servername example.com 192.0.2.7:443
 ```
 
 Usage: `certinfo [--timeout SECONDS] [--servername NAME] HOST[:PORT]`.
 The default port is 443, timeout 10 seconds. The timeout is a positive integer up
 to 999999; GNU `timeout` allows one additional second before forced termination.
-IPv6 must be bracketed. Scoped zone identifiers are not supported. DNS targets send
-SNI automatically; IP targets do not unless `--servername` explicitly supplies it.
+Targets are domain names or IPv4 addresses; connections use IPv4. IPv6 is not
+supported yet. DNS targets send SNI automatically; IP targets do not unless
+`--servername` explicitly supplies it.
 
 Prints host, port, CN, issuer, expiration, and DNS/IP subject alternative names.
 Missing CN or DNS/IP SANs are shown as `(none)`; this is not a parsing failure.
-IPv6 SANs retain the complete address; OpenSSL may expand and capitalise their
-representation. Other SAN types (such as URI/email) are not included. Subject
-values use OpenSSL escaping rather than unsafe shell interpretation.
+Other SAN types (such as URI/email) are not included. Subject values use OpenSSL
+escaping rather than unsafe shell interpretation.
 
 Dependencies: OpenSSL, GNU `timeout`, `mktemp`, `cat`, `rm`, `sed`, `tr`.
 Connection or certificate parsing failures return 1 without a partial result table.
@@ -181,24 +180,3 @@ Missing values display `unknown` or `(no caller data)`; no removal entries is an
 explicit successful empty result. Tabs, newlines and backslashes within caller
 fields are TSV-escaped. Output may contain usernames and client identifiers; treat
 it as operational information when sharing. No cluster resources are changed.
-
-## `ocptool`: unchanged, separate work
-
-```bash
-python3 openshift/ocptool --help
-python3 openshift/ocptool capacity
-python3 openshift/ocptool nstop -n application
-python3 openshift/ocptool ptop --limit 20
-python3 openshift/ocptool free
-```
-
-Requires Python 3.8+, `oc` with appropriate cluster access, and **`tabulate`** (its
-current import is mandatory even for help). Commands query nodes/pods, descriptions
-and metrics; access depends on the selected action. Review the script before use.
-
-This tool is deliberately unchanged. Known follow-up concerns include decimal
-memory conversions, default-namespace metrics matching, missing metrics represented
-as zero, the unused `--label` option and error handling. The `free` report's aggregate
-N-1 arithmetic is not a scheduler guarantee. Do not rely on these reports for
-capacity or upgrade decisions without independent validation. The new Bash test
-suite does not validate its accounting; only Python syntax is checked.
