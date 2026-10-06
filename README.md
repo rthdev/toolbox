@@ -11,7 +11,7 @@ Commands intentionally have no `.sh` or `.py` extension.
 | [`certinfo`](linux/certinfo) | TLS certificate CN, issuer, expiration and SANs | Bash, OpenSSL, GNU coreutils |
 | [`lsswap`](linux/lsswap) | Top processes by swap usage in MiB | Bash, Linux `/proc`, awk, coreutils |
 | [`pls`](linux/pls) | Container owner/name hints from visible conmon processes | Bash, procps `ps`, text utilities |
-| [`kdf`](openshift/kdf) | Inspect mounted PVC filesystem usage inside a selected container | Bash, `kubectl`, jq, container `df` |
+| [`kdf`](openshift/kdf) | Disk-free report for all PVCs and running pod mounts in a namespace | Bash, `kubectl`, jq, container `df` |
 | [`ocprems`](openshift/ocprems) | API-removal request counts and recent callers | Bash, `oc`, jq |
 
 See the [command guide](docs/commands.md) for options, examples, dependencies,

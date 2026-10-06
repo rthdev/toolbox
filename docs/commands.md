@@ -99,40 +99,56 @@ containers, inaccessible processes and runtimes without conmon are absent.
 ambiguous; ordinary embedded spaces are preserved. Container names are never
 executed or evaluated. Owner names are subject to the process tool's output format.
 
-## `kdf`: mounted PVC filesystem usage
+## `kdf`: namespace PVC filesystem usage
 
 ```bash
-./openshift/kdf -n application data
-./openshift/kdf -n application --pod worker-0 --container app data
-./openshift/kdf -n application                 # all PVCs, sorted by name
+./openshift/kdf                            # current-context namespace
+./openshift/kdf -n application             # selected namespace
+./openshift/kdf --namespace application
 ```
 
-Usage: `kdf [-n NAMESPACE|--namespace NAMESPACE] [-c CONTAINER|--container CONTAINER]
-[--pod POD] [PVC]`. Supports `--` before the positional PVC name.
-Requires `kubectl` and jq. Uses the specified namespace or the current kubeconfig
-context's namespace; it never scans all namespaces or switches context.
+Usage: `kdf [-n NAMESPACE|--namespace NAMESPACE]`. Requires Bash, `kubectl` and jq.
+Lists **all PVCs** in the specified namespace or the current kubeconfig context's
+namespace; it never scans all namespaces or switches context. There are no PVC,
+pod or container selectors.
 
-Fetches PVCs once and pods once when needed, then matches PVC-backed volumes to
-regular containers and their mount paths. Multiple eligible pods require `--pod`;
-multiple containers require `--container`. It never arbitrarily selects the first
-pod/container. All unique paths within the selected container are inspected,
-including paths with spaces. Init/ephemeral containers and raw block volume devices
-are not inspected. Pod readiness is not guaranteed by discovery; exec can still fail.
+Prints one pipe-delimited table with this header:
 
-Runs `kubectl ... exec POD -c CONTAINER -- df -h -- PATH...`. The container must have
-`df` supporting `-h` and `--`. This executes a read-only filesystem-reporting command
-inside a workload; it does not create helper pods or change resources. The output
-is filesystem usage visible at the mounts, not the requested PVC allocation or an
-independent storage-backend usage measurement.
+```text
+PVC Name | Pod Name | Filesystem | Size | Used | Avail | Mounted on
+```
 
-Required permissions in the namespace: list PVCs, list/get pods, and create
-`pods/exec`; some CLI transports additionally require get on `pods/exec`. Even
-single-PVC mode lists PVCs. Use narrowly scoped RBAC rather than cluster-admin.
+Fetches PVCs and pods once each, matches actual PVC-backed volume names to regular
+container mounts, and reports every matching **Running pod** and mount path.
+Rows are sorted by PVC, pod and mount path. The same pod/path shared by containers
+is inspected once. When container statuses are available, only running containers
+are eligible; absent/null container statuses fall back to regular containers in a
+Running pod. Pending, completed and other non-Running pods are never exec targets.
+Init and ephemeral containers are excluded.
 
-No PVCs is a successful empty result. A named PVC not found, no matching mount,
-ambiguous selection, malformed data, query failure or exec failure returns 1.
-All-PVC mode stops at the first failure; earlier results may already be printed.
-Discovery is a snapshot; pods can change between discovery and exec.
+A PVC with no eligible running filesystem mount gets one row with only its PVC
+name and all other fields blank. This includes unmounted claims and raw-block
+PVCs, which cannot be inspected with `df`. No PVCs produces just the header.
+
+Runs `kubectl ... exec POD -c CONTAINER -- df -P -h -- PATH` per unique pod/path.
+The container must have `df` supporting `-P`, `-h` and `--`. Paths are passed as
+quoted arguments, including spaces. Numeric columns are parsed from portable
+`df` output; mountpoint spaces are preserved and repeated headers are omitted.
+The report describes the filesystem visible at the mount, not the requested PVC
+allocation or an independent storage-backend usage measurement. Different mounts
+can report the same underlying filesystem; values must not be summed as PVC totals.
+
+This executes a read-only reporting command inside workloads; no helper pods or
+resources are created. Required namespace permissions: list PVCs, list/get pods,
+and create `pods/exec`; some CLI transports additionally require get on `pods/exec`.
+Use narrowly scoped RBAC rather than cluster-admin.
+
+Query or malformed discovery-data failures return 1. Exec/df failures or unparseable
+`df` output write diagnostics to stderr, omit usage for that failed mount, and
+continue with the remaining mounts, returning 1 overall. No usage is fabricated.
+Successful reports and help return 0; invalid arguments return 2. Discovery is a
+snapshot: workloads may change before exec, and a Running pod does not guarantee
+exec access or the presence of `df`.
 
 ## `ocprems`: APIs marked for removal
 
