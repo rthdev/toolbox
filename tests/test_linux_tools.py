@@ -48,7 +48,7 @@ class LinuxToolsTests(unittest.TestCase):
         self.stub("oc", '[[ $1 == kustomize && $# == 2 ]] || exit 23\nprintf "%s\\0" "$2" >> "$OC_LOG"\n')
         return repo
 
-    def test_gkc_whole_repo_canonical_validation(self):
+    def test_gkc_canonical_validation(self):
         repo = self.git_repo()
         dirs = []
         for i, filename in enumerate(("kustomization.yaml", "kustomization.yml", "Kustomization")):
@@ -57,10 +57,23 @@ class LinuxToolsTests(unittest.TestCase):
             (directory / filename).write_text("resources: []\n")
             (directory / "unrelated notes.txt").write_text("not a resource")
             dirs.append(directory)
-        result = self.run_tool("gkc", cwd=dirs[0])
+        result = self.run_tool("gkc", cwd=repo)
         self.assertEqual(result.returncode, 0, result.stderr)
         actual = Path(self.env["OC_LOG"]).read_bytes().split(b"\0")[:-1]
         self.assertCountEqual(actual, [os.fsencode(p) for p in dirs])
+
+    def test_gkc_searches_only_current_directory_and_descendants(self):
+        repo = self.git_repo()
+        start = repo / "selected"
+        child = start / "nested" / "overlay"
+        sibling = repo / "sibling"
+        for directory in (repo, start, child, sibling):
+            directory.mkdir(parents=True, exist_ok=True)
+            (directory / "kustomization.yaml").write_text("resources: []\n")
+        result = self.run_tool("gkc", cwd=start)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        actual = Path(self.env["OC_LOG"]).read_bytes().split(b"\0")[:-1]
+        self.assertCountEqual(actual, [os.fsencode(p) for p in (start, child)])
 
     def proc_fixture(self):
         proc = self.work / "proc fixture"
@@ -137,7 +150,7 @@ class LinuxToolsTests(unittest.TestCase):
     def test_missing_dependencies_are_operational_errors(self):
         repo = self.git_repo()
         proc = self.proc_fixture()
-        for tool, deps in (("gkc", ("git", "find", "sort", "oc")),
+        for tool, deps in (("gkc", ("find", "sort", "oc")),
                            ("lsswap", ("sort", "awk")),
                            ("pls", ("ps", "sort"))):
             for missing in deps:
@@ -163,7 +176,7 @@ class LinuxToolsTests(unittest.TestCase):
 
     def test_gkc_errors_and_empty_repo(self):
         repo = self.git_repo()
-        self.assertEqual(self.run_tool("gkc").returncode, 1)
+        self.assertEqual(self.run_tool("gkc").returncode, 0)
         self.assertEqual(self.run_tool("gkc", cwd=repo).returncode, 0)
         for directory in ("a", "b"):
             (repo / directory).mkdir()

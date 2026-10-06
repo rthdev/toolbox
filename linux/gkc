@@ -1,6 +1,6 @@
 #!/bin/bash
 
-usage() { printf '%s\n' 'Usage: gkc [-h|--help]' 'Validate every kustomization in the Git working tree with oc kustomize.'; }
+usage() { printf '%s\n' 'Usage: gkc [-h|--help]' 'Validate kustomizations in the current directory and its descendants with oc kustomize.'; }
 if [[ $# == 1 && ($1 == -h || $1 == --help) ]]; then
   usage
   exit 0
@@ -10,13 +10,13 @@ if (( $# )); then
   exit 2
 fi
 
-for dependency in git find sort oc; do
+for dependency in find sort oc; do
   command -v "$dependency" >/dev/null || {
     printf 'gkc: required command not found: %s\n' "$dependency" >&2
     exit 1
   }
 done
-root=$(git rev-parse --show-toplevel) || exit 1
+root=$PWD
 set -o pipefail
 shopt -s lastpipe
 # NUL-delimited directories preserve whitespace and deduplicate variant names.
@@ -24,7 +24,7 @@ find "$root" -name .git -prune -o -type f \( -name kustomization.yaml -o \
   -name kustomization.yml -o -name Kustomization \) -printf '%h\0' |
   sort -zu | mapfile -d '' -t dirs || exit 1
 if (( ${#dirs[@]} == 0 )); then
-  printf '%s\n' 'No kustomizations found in repository.'
+  printf '%s\n' 'No kustomizations found in the current directory or its descendants.'
   exit 0
 fi
 failed=0

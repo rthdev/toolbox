@@ -9,7 +9,7 @@ Commands intentionally have no `.sh` or `.py` extension.
 | --- | --- | --- |
 | [`ced`](linux/ced) | Quick TLS certificate expiration summary | Bash, OpenSSL, GNU coreutils |
 | [`certinfo`](linux/certinfo) | TLS certificate CN, issuer, expiration and SANs | Bash, OpenSSL, GNU coreutils |
-| [`gkc`](linux/gkc) | Build-check Kustomize directories throughout a Git working tree | Bash, Git, `oc`, findutils |
+| [`gkc`](linux/gkc) | Build-check Kustomize directories from the current directory down | Bash, `oc`, findutils |
 | [`lsswap`](linux/lsswap) | Top processes by swap usage in MiB | Bash, Linux `/proc`, awk, coreutils |
 | [`pls`](linux/pls) | Container owner/name hints from visible conmon processes | Bash, procps `ps`, text utilities |
 | [`kdf`](openshift/kdf) | Inspect mounted PVC filesystem usage inside a selected container | Bash, `kubectl`, jq, container `df` |

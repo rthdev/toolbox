@@ -66,12 +66,13 @@ disables colors. `tput` is optional. Dependencies are OpenSSL, GNU `timeout`,
 ## `gkc`: validate Kustomize builds
 
 ```bash
-# Run from anywhere inside the Git working tree to inspect the whole tree.
+# Run from the directory whose subtree you want to validate.
 /path/to/toolbox/linux/gkc
 ```
 
-No operational arguments. Requires Git, GNU `find`/`sort`, and `oc` with the
-`kustomize` subcommand. Finds `kustomization.yaml`, `kustomization.yml`, and
+No operational arguments. Requires GNU `find`/`sort` and `oc` with the
+`kustomize` subcommand; Git is not required. Searches the current working directory
+and its descendants, never parent or sibling directories. Finds `kustomization.yaml`, `kustomization.yml`, and
 `Kustomization`, excluding `.git`; each distinct directory is built once.
 Whitespace/newlines in paths are preserved. Untracked files and directories are
 included; Git ignore rules are not used to restrict discovery.
