@@ -30,7 +30,7 @@ class LinuxToolsTests(unittest.TestCase):
 
     def test_help_and_usage_before_dependencies(self):
         env = dict(self.env, PATH=str(self.bin))
-        for tool in ("gkc", "lsswap", "pls"):
+        for tool in ("lsswap", "pls"):
             for flag in ("-h", "--help"):
                 with self.subTest(tool=tool, flag=flag):
                     result = self.run_tool(tool, flag, env=env)
@@ -39,100 +39,6 @@ class LinuxToolsTests(unittest.TestCase):
             for args in (("unexpected",), ("--help", "extra")):
                 with self.subTest(tool=tool, args=args):
                     self.assertEqual(self.run_tool(tool, *args, env=env).returncode, 2)
-
-    def git_repo(self):
-        repo = self.work / "repo with spaces"
-        repo.mkdir()
-        subprocess.run(["git", "init", "-q", str(repo)], check=True)
-        self.env["OC_LOG"] = str(self.work / "oc.log")
-        self.stub("oc", '[[ $1 == kustomize && $# == 2 ]] || exit 23\nprintf "%s\\0" "$2" >> "$OC_LOG"\n')
-        return repo
-
-    def test_gkc_missing_file_fails_despite_successful_build(self):
-        repo = self.git_repo()
-        for filename in ("kustomization.yaml", "kustomization.yml", "Kustomization"):
-            with self.subTest(filename=filename):
-                directory = repo / filename.replace(".", "-")
-                directory.mkdir()
-                (directory / filename).write_text("resources: []\n")
-                (directory / "unrelated notes.txt").write_text("not a resource")
-                result = self.run_tool("gkc", cwd=directory)
-                self.assertEqual(result.returncode, 1)
-                self.assertIn("File unrelated notes.txt not found in", result.stderr)
-                self.assertIn(str(directory / filename), result.stderr)
-
-    def test_gkc_canonical_validation(self):
-        repo = self.git_repo()
-        dirs = []
-        for i, filename in enumerate(("kustomization.yaml", "kustomization.yml", "Kustomization")):
-            directory = repo / f"overlay {i}"
-            directory.mkdir()
-            (directory / filename).write_text("resources:\n- listed file.yaml\n- listed directory\n")
-            (directory / "listed file.yaml").write_text("resource")
-            (directory / "listed directory").mkdir()
-            (directory / ".hidden file").write_text("ignored")
-            (directory / ".hidden directory").mkdir()
-            dirs.append(directory)
-        result = self.run_tool("gkc", cwd=repo)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        actual = Path(self.env["OC_LOG"]).read_bytes().split(b"\0")[:-1]
-        self.assertCountEqual(actual, [os.fsencode(p) for p in dirs])
-
-    def test_gkc_searches_only_current_directory_and_descendants(self):
-        repo = self.git_repo()
-        start = repo / "selected"
-        child = start / "nested" / "overlay"
-        sibling = repo / "sibling"
-        for directory in (repo, start, child, sibling):
-            directory.mkdir(parents=True, exist_ok=True)
-            (directory / "kustomization.yaml").write_text("resources: []\n")
-        (start / "kustomization.yaml").write_text("resources:\n- nested/overlay\n")
-        result = self.run_tool("gkc", cwd=start)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        actual = Path(self.env["OC_LOG"]).read_bytes().split(b"\0")[:-1]
-        self.assertCountEqual(actual, [os.fsencode(p) for p in (start, child)])
-
-    def test_gkc_literal_special_entry_names(self):
-        repo = self.git_repo()
-        names = ("space name.yaml", "-option.yaml", "a.b", "[ab]*?.yaml",
-                 "quote'\"\\file", "first\nsecond", "trailing\n")
-        for index, name in enumerate(names):
-            with self.subTest(name=name):
-                directory = repo / str(index)
-                directory.mkdir()
-                (directory / name).write_text("resource")
-                kfile = directory / "kustomization.yaml"
-                # Include decoys that regex or multiline grep could accept.
-                kfile.write_text("# space\n# name.yaml\n# axb\n# abbbb.yaml\n# first\n# second\n# trailing")
-                result = self.run_tool("gkc", cwd=directory)
-                self.assertEqual(result.returncode, 1)
-                self.assertIn(f"File {name} not found in", result.stderr)
-                # Deliberately textual: comments count, and trailing newlines survive.
-                kfile.write_text("# " + name)
-                result = self.run_tool("gkc", cwd=directory)
-                self.assertEqual(result.returncode, 0, result.stderr)
-
-    def test_gkc_missing_directory_continues_checks_and_builds(self):
-        repo = self.git_repo()
-        for name in ("a", "b"):
-            directory = repo / name
-            directory.mkdir()
-            (directory / "kustomization.yaml").write_text("resources: []\n")
-            (directory / "unlisted directory").mkdir()
-            (directory / "unlisted.yaml").write_text("resource")
-        for fail_build in (False, True):
-            with self.subTest(fail_build=fail_build):
-                Path(self.env["OC_LOG"]).unlink(missing_ok=True)
-                self.stub("oc", 'printf "%s\\0" "$2" >> "$OC_LOG"\n' +
-                          ('exit 31\n' if fail_build else 'exit 0\n'))
-                result = self.run_tool("gkc", cwd=repo)
-                self.assertEqual(result.returncode, 1)
-                for name in ("a", "b"):
-                    for entry in ("unlisted directory", "unlisted.yaml"):
-                        self.assertIn(f"File {entry} not found in {repo / name / 'kustomization.yaml'}",
-                                      result.stderr)
-                actual = Path(self.env["OC_LOG"]).read_bytes().split(b"\0")[:-1]
-                self.assertEqual(actual, [os.fsencode(repo / name) for name in ("a", "b")])
 
     def proc_fixture(self):
         proc = self.work / "proc fixture"
@@ -207,10 +113,8 @@ class LinuxToolsTests(unittest.TestCase):
         self.assertIn("ps failed", result.stderr)
 
     def test_missing_dependencies_are_operational_errors(self):
-        repo = self.git_repo()
         proc = self.proc_fixture()
-        for tool, deps in (("gkc", ("find", "sort", "oc")),
-                           ("lsswap", ("sort", "awk")),
+        for tool, deps in (("lsswap", ("sort", "awk")),
                            ("pls", ("ps", "sort"))):
             for missing in deps:
                 with self.subTest(tool=tool, missing=missing):
@@ -218,11 +122,11 @@ class LinuxToolsTests(unittest.TestCase):
                     isolated.mkdir()
                     for dep in deps:
                         if dep != missing:
-                            target = str(self.bin / dep) if dep == "oc" else shutil.which(dep)
+                            target = shutil.which(dep)
                             self.assertIsNotNone(target)
                             assert target is not None
                             (isolated / dep).symlink_to(target)
-                    result = self.run_tool(tool, cwd=repo,
+                    result = self.run_tool(tool,
                                            env=dict(self.env, PATH=str(isolated), PROC_ROOT=str(proc)))
                     self.assertEqual(result.returncode, 1, result.stderr)
                     self.assertTrue(result.stderr)
@@ -232,36 +136,6 @@ class LinuxToolsTests(unittest.TestCase):
         result = self.run_tool("lsswap")
         self.assertEqual(result.returncode, 1)
         self.assertTrue(result.stderr)
-
-    def test_gkc_errors_and_empty_repo(self):
-        repo = self.git_repo()
-        self.assertEqual(self.run_tool("gkc").returncode, 0)
-        self.assertEqual(self.run_tool("gkc", cwd=repo).returncode, 0)
-        for directory in ("a", "b"):
-            (repo / directory).mkdir()
-            (repo / directory / "Kustomization").write_text("resources: []\n")
-        self.stub("oc", 'printf "%s\\0" "$2" >> "$OC_LOG"\nprintf "invalid kustomization\\n" >&2\nexit 31\n')
-        result = self.run_tool("gkc", cwd=repo)
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("invalid kustomization", result.stderr)
-        self.assertEqual(len(Path(self.env["OC_LOG"]).read_bytes().split(b"\0")[:-1]), 2)
-        Path(self.env["OC_LOG"]).unlink()
-        self.stub("find", 'printf "%s\\0" "$1/a"\nprintf "find failed\\n" >&2\nexit 17\n')
-        result = self.run_tool("gkc", cwd=repo)
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("find failed", result.stderr)
-        self.assertFalse(Path(self.env["OC_LOG"]).exists())
-
-    def test_gkc_newline_paths_deduplication_and_git_exclusion(self):
-        repo = self.git_repo()
-        directory = repo / "line\nbreak [*]"
-        directory.mkdir()
-        for filename in ("kustomization.yaml", "Kustomization"):
-            (directory / filename).write_text("resources: []\n")
-        (repo / ".git" / "Kustomization").write_text("ignore me")
-        result = self.run_tool("gkc", cwd=repo)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(Path(self.env["OC_LOG"]).read_bytes(), os.fsencode(directory) + b"\0")
 
     def test_pipeline_dependency_failures(self):
         self.proc_fixture()

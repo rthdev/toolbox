@@ -9,7 +9,6 @@ Commands intentionally have no `.sh` or `.py` extension.
 | --- | --- | --- |
 | [`ced`](linux/ced) | Quick TLS certificate expiration summary | Bash, OpenSSL, GNU coreutils |
 | [`certinfo`](linux/certinfo) | TLS certificate CN, issuer, expiration and SANs | Bash, OpenSSL, GNU coreutils |
-| [`gkc`](linux/gkc) | Check Kustomize builds and direct-entry inclusion from the current directory down | Bash, `oc`, findutils, coreutils |
 | [`lsswap`](linux/lsswap) | Top processes by swap usage in MiB | Bash, Linux `/proc`, awk, coreutils |
 | [`pls`](linux/pls) | Container owner/name hints from visible conmon processes | Bash, procps `ps`, text utilities |
 | [`kdf`](openshift/kdf) | Inspect mounted PVC filesystem usage inside a selected container | Bash, `kubectl`, jq, container `df` |
@@ -17,10 +16,6 @@ Commands intentionally have no `.sh` or `.py` extension.
 
 See the [command guide](docs/commands.md) for options, examples, dependencies,
 permissions, exit codes and limitations.
-
-`gkc` also requires every nonhidden direct file/directory name (except recognized
-kustomization files) to occur literally in the kustomization text. This restores
-the original inclusion heuristic; it is not semantic YAML reference resolution.
 
 ## Getting started
 
@@ -64,8 +59,6 @@ CONTRIBUTING.md        Development and branch/PR workflow
   data. Neither needs a blanket cluster-admin grant; see the permission notes.
 - Certificate inspection is **not** certificate-chain or hostname verification.
   Successful output does not establish that an endpoint is trusted.
-- Kustomize builds can fetch remote resources; inspect untrusted repositories before
-  running `gkc`. No resources are applied to a cluster.
 - Do not commit credentials, tokens, private keys or kubeconfig files.
 
 Before cluster operations, for example:

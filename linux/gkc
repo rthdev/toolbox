@@ -1,63 +1,71 @@
 #!/bin/bash
+#
+### Git Kustomize Check ###
 
-usage() { printf '%s\n' 'Usage: gkc [-h|--help]' 'Check Kustomize builds and direct-entry inclusion in the current directory and its descendants.'; }
-if [[ $# == 1 && ($1 == -h || $1 == --help) ]]; then
-  usage
-  exit 0
-fi
-if (( $# )); then
-  usage >&2
-  exit 2
-fi
-
-for dependency in find sort oc; do
-  command -v "$dependency" >/dev/null || {
-    printf 'gkc: required command not found: %s\n' "$dependency" >&2
-    exit 1
-  }
-done
-root=$PWD
-set -o pipefail
-shopt -s lastpipe
-# NUL-delimited directories preserve whitespace and deduplicate variant names.
-find "$root" -name .git -prune -o -type f \( -name kustomization.yaml -o \
-  -name kustomization.yml -o -name Kustomization \) -printf '%h\0' |
-  sort -zu | mapfile -d '' -t dirs || exit 1
-if (( ${#dirs[@]} == 0 )); then
-  printf '%s\n' 'No kustomizations found in the current directory or its descendants.'
-  exit 0
-fi
+# Initialize exit variable
 failed=0
-for dir in "${dirs[@]}"; do
-  printf 'Checking %s ...\n' "$dir"
-  if oc kustomize "$dir" >/dev/null; then
-    printf '%s\n' 'OK'
+
+# Check if we are in a git repo, otherwise fail
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 || {
+  echo "Not inside a git repository"
+  exit 1
+}
+
+# Gather all directories with kustomization.yaml
+all_changes=$(find . -type f -name kustomization.yaml)
+
+if [[ -z "${all_changes}" ]]; then
+  echo "No changes in repository detected, exiting"
+  exit 0
+fi
+
+# Construct a directory list
+dirs=$(echo "${all_changes}" | xargs dirname | sort -u)
+
+# Loop over directories checking for kustomize consistency
+for dir in ${dirs}; do
+  kfile="${dir}/kustomization.yaml"
+
+  if [[ ! -f "${kfile}" ]]; then
+    echo "Skipping ${dir} (no kustomization.yaml)"
+    continue
+  fi
+
+  echo "Checking ${dir} ..."
+  echo -n "... Can kustomize ..."
+  if oc kustomize "${dir}" > /dev/null; then
+    echo "OK"
   else
-    printf '%s\n' 'FAILED' >&2
+    echo "FAILED"
     failed=1
   fi
 
-  # Original direct-entry heuristic: literal text, not YAML interpretation.
-  for kfile in "$dir/kustomization.yaml" "$dir/kustomization.yml" "$dir/Kustomization"; do
-    [[ -f "$kfile" ]] || continue
-    if [[ ! -r "$kfile" ]]; then
-      printf 'gkc: cannot read %s\n' "$kfile" >&2
+  files_in_dir=$(ls -I kustomization.yaml ${dir})
+  if [[ -z "${files_in_dir}" ]]; then
+    continue
+  fi
+
+  echo -n "... All files in kustomization.yaml ..."
+
+  file_failed=0
+  file_failed_detail=""
+
+  for file in ${files_in_dir}; do
+    if ! grep ${file} ${kfile} >/dev/null; then
       failed=1
-      continue
+      file_failed=1
+      file_failed_detail="${file_failed_detail}... File ${file} not found in ${kfile}"
     fi
-    # read preserves trailing newlines; EOF is expected without a NUL delimiter.
-    IFS= read -r -d '' content < "$kfile" || :
-    for entry in "$dir"/*; do
-      [[ -e "$entry" || -L "$entry" ]] || continue
-      name=${entry##*/}
-      case "$name" in
-        kustomization.yaml|kustomization.yml|Kustomization) continue ;;
-      esac
-      if [[ "$content" != *"$name"* ]]; then
-        printf 'gkc: File %s not found in %s\n' "$name" "$kfile" >&2
-        failed=1
-      fi
-    done
   done
+
+  if [[ "${file_failed}" -eq 1 ]]; then
+    echo "FAILED"
+    echo ${file_failed_detail}
+  else
+    echo "OK"
+  fi
+
 done
-exit "$failed"
+
+
+exit ${failed}
