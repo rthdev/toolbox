@@ -63,7 +63,7 @@ green. Redirected output, `TERM=dumb`, an unset/empty `TERM`, or any set `NO_COL
 disables colors. `tput` is optional. Dependencies are OpenSSL, GNU `timeout`,
 `mktemp`, `cat`, `rm` and GNU `date`; no trust or hostname validation is performed.
 
-## `gkc`: validate Kustomize builds
+## `gkc`: validate Kustomize builds and file inclusion
 
 ```bash
 # Run from the directory whose subtree you want to validate.
@@ -77,9 +77,21 @@ and its descendants, never parent or sibling directories. Finds `kustomization.y
 Whitespace/newlines in paths are preserved. Untracked files and directories are
 included; Git ignore rules are not used to restrict discovery.
 
-Uses `oc kustomize` as the source of validation. Unrelated documentation or helper
-files need not appear in a kustomization. Continues through build failures and
-returns 1 if any fail. No matches is an explicit successful empty result.
+Runs `oc kustomize` and independently checks file inclusion, retaining the original
+direct-entry heuristic: every nonhidden immediate child (files and directories,
+including documentation and helper files) must have its literal basename somewhere
+in the kustomization text. The three recognized kustomization filenames themselves
+are excluded. If multiple recognized files exist, each is checked, but the directory
+is built only once. Hidden entries are ignored for inclusion; discovery still
+descends into hidden directories other than `.git`.
+
+This is a literal substring check, **not semantic YAML resolution**: comments and
+longer strings can satisfy it, while YAML-escaped filenames may not. It does not
+interpret resources, generators, patches, or remote references. Spaces, newlines,
+and pattern characters in filenames are treated literally, not as grep patterns.
+Missing entries are reported even when the build fails. All later entries and
+directories are still checked/built; any build or inclusion failure returns 1.
+No matches is an explicit successful empty result.
 
 Does not apply resources or need cluster access for local resources. Remote
 Kustomize bases can trigger downloads and need network access/authentication.

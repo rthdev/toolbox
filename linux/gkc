@@ -1,6 +1,6 @@
 #!/bin/bash
 
-usage() { printf '%s\n' 'Usage: gkc [-h|--help]' 'Validate kustomizations in the current directory and its descendants with oc kustomize.'; }
+usage() { printf '%s\n' 'Usage: gkc [-h|--help]' 'Check Kustomize builds and direct-entry inclusion in the current directory and its descendants.'; }
 if [[ $# == 1 && ($1 == -h || $1 == --help) ]]; then
   usage
   exit 0
@@ -36,5 +36,28 @@ for dir in "${dirs[@]}"; do
     printf '%s\n' 'FAILED' >&2
     failed=1
   fi
+
+  # Original direct-entry heuristic: literal text, not YAML interpretation.
+  for kfile in "$dir/kustomization.yaml" "$dir/kustomization.yml" "$dir/Kustomization"; do
+    [[ -f "$kfile" ]] || continue
+    if [[ ! -r "$kfile" ]]; then
+      printf 'gkc: cannot read %s\n' "$kfile" >&2
+      failed=1
+      continue
+    fi
+    # read preserves trailing newlines; EOF is expected without a NUL delimiter.
+    IFS= read -r -d '' content < "$kfile" || :
+    for entry in "$dir"/*; do
+      [[ -e "$entry" || -L "$entry" ]] || continue
+      name=${entry##*/}
+      case "$name" in
+        kustomization.yaml|kustomization.yml|Kustomization) continue ;;
+      esac
+      if [[ "$content" != *"$name"* ]]; then
+        printf 'gkc: File %s not found in %s\n' "$name" "$kfile" >&2
+        failed=1
+      fi
+    done
+  done
 done
 exit "$failed"
