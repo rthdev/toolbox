@@ -1,53 +1,125 @@
 #!/bin/bash
-# Certificate Expiration Date (ced) Checker
+# Certificate Expiration Date: inspection only, not trust validation.
+readonly COLOR_RED=1
+readonly COLOR_YELLOW=3
+readonly COLOR_GREEN=2
 
-# Configure to your liking
-REDWHENLESSTHANDAYS=30
-YELLOWWHENLESSTHANDAYS=90
-DIFFCMD="/usr/bin/datediff"
+# Keep TLS helpers local so this command can be copied independently.
+tls_usage() {
+    printf 'Usage: %s [--timeout SECONDS] [--servername NAME] HOST[:PORT]\n' "${0##*/}"
+    printf '%s\n' 'Target: domain name or IPv4 address. Port defaults to 443; timeout to 10 seconds.'
+    printf '%s\n' 'SECONDS is an integer from 1 to 999999 (plus a 1-second kill grace).'
+    printf '%s\n' 'DNS targets send SNI; IP targets do not. --servername NAME overrides SNI.'
+    printf '%s\n' 'Inspect only: self-signed and expired certificates are accepted.'
+    printf '%s\n' 'Exit codes: 0 success, 1 operational failure, 2 usage error.'
+}
 
-# Terminal colors
-red=$(tput setaf 1)
-green=$(tput setaf 2)
-yellow=$(tput setaf 3)
-reset=$(tput sgr0)
-COLOR=${reset}
+tls_bad_usage() {
+    printf '%s: %s\n' "${0##*/}" "$1" >&2
+    tls_usage >&2
+    exit 2
+}
 
-# Simply check if 1 argument has been given. No more sanity checks done
-if [ -z "$1" ]
-then
-  echo "please enter host:port as argument"
+tls_args() {
+    TLS_TIMEOUT=10
+    TLS_SERVERNAME=''
+    local target='' port=443
+    while (($#)); do
+        case $1 in
+            -h|--help) tls_usage; exit 0 ;;
+            --timeout|--servername)
+                (($# >= 2)) || tls_bad_usage "missing value for $1"
+                if [[ $1 == --timeout ]]; then
+                    if [[ ! $2 =~ ^[0-9]{1,6}$ ]] || ((10#$2 == 0)); then
+                        tls_bad_usage 'invalid timeout'
+                    fi
+                    TLS_TIMEOUT=$((10#$2))
+                else
+                    [[ $2 =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]*$ ]] || tls_bad_usage 'invalid servername'
+                    TLS_SERVERNAME=$2
+                fi
+                shift 2 ;;
+            --)
+                shift
+                if [[ -n $target ]] || (($# != 1)); then
+                    tls_bad_usage 'expected one target'
+                fi
+                target=$1
+                shift ;;
+            -*) tls_bad_usage "unknown option: $1" ;;
+            *) [[ -z $target ]] || tls_bad_usage 'expected one target'; target=$1; shift ;;
+        esac
+    done
+    [[ -n $target ]] || tls_bad_usage 'missing target'
+    if [[ $target =~ ^([a-zA-Z0-9_][a-zA-Z0-9_.-]*)(:([0-9]+))?$ ]]; then
+        TLS_HOST=${BASH_REMATCH[1]}
+        [[ -z ${BASH_REMATCH[2]} ]] || port=${BASH_REMATCH[3]}
+        TLS_CONNECT=$TLS_HOST
+    else
+        tls_bad_usage 'expected a domain name or IPv4 address, optionally followed by :PORT'
+    fi
+    if [[ ! $port =~ ^[0-9]{1,5}$ ]] || ((10#$port < 1 || 10#$port > 65535)); then
+        tls_bad_usage 'invalid port'
+    fi
+    TLS_PORT=$((10#$port))
+    TLS_CONNECT+=":$TLS_PORT"
+}
+
+tls_error() {
+    printf '%s: %s\n' "${0##*/}" "$*" >&2
+    exit 1
+}
+
+tls_fetch() {
+    local dep status=0
+    for dep in openssl timeout mktemp; do
+        command -v "$dep" >/dev/null || tls_error "missing dependency: $dep"
+    done
+    local -a sni=(-noservername)
+    if [[ -n $TLS_SERVERNAME ]]; then
+        sni=(-servername "$TLS_SERVERNAME")
+    elif [[ ! $TLS_HOST =~ ^[0-9.]+$ ]]; then
+        sni=(-servername "$TLS_HOST")
+    fi
+    TLS_WORK=$(mktemp -d "${TMPDIR:-/tmp}/tls.XXXXXXXX") || tls_error 'cannot create temporary directory'
+    trap 'rm -rf -- "$TLS_WORK"' EXIT
+    trap 'exit 1' HUP INT TERM
+    timeout --kill-after=1 "$TLS_TIMEOUT" openssl s_client -4 \
+        -connect "$TLS_CONNECT" "${sni[@]}" -showcerts </dev/null \
+        >"$TLS_WORK/peer" 2>"$TLS_WORK/diagnostics" || status=$?
+    if ((status == 124 || status == 137)); then
+        tls_error "connection to $TLS_CONNECT timed out after $TLS_TIMEOUT seconds"
+    fi
+    if ((status != 0)); then
+        cat "$TLS_WORK/diagnostics" >&2
+        tls_error "TLS connection to $TLS_CONNECT failed (status $status)"
+    fi
+}
+
+export LC_ALL=C
+tls_args "$@"
+command -v date >/dev/null || tls_error 'missing dependency: GNU date'
+tls_fetch
+expires=$(openssl x509 -in "$TLS_WORK/peer" -noout -enddate) || tls_error 'cannot parse certificate expiry'
+expires=${expires#notAfter=}
+end=$(date -u -d "$expires" +%s) || tls_error 'cannot convert expiry (GNU date required)'
+now=$(date -u +%s) || tls_error 'cannot read current time'
+# Floor, not truncation: any expired certificate has a negative day count.
+seconds=$((end - now))
+if ((seconds < 0)); then
+    days=$(((seconds - 86399) / 86400))
 else
-  # If we have no colon, assume :443
-  if [[ ! "${1}" =~ :[0-9]+$ ]];
-  then
-    TARGET="${1}:443"
-  else
-    TARGET="${1}"
-  fi
-
-  DATES=$(echo | openssl s_client -connect ${TARGET} 2>/dev/null | openssl x509 -noout -dates)
-  DATE_START=$(echo $DATES | grep notBefore | awk -F"=" '{ print $NF }')
-  DATE_END=$(echo $DATES | grep notAfter | awk -F"=" '{ print $NF }')
-  
-  
-  if [ -x "${DIFFCMD}" ]
-  then
-    DAYS_TO_END=$(${DIFFCMD} -i "%b %d %H:%M:%S %Y %Z" -f "%d" now "${DATE_END}")
-    COLOR="${green}"
-  
-    if [ ${DAYS_TO_END} -lt ${YELLOWWHENLESSTHANDAYS} ]
-    then
-      COLOR=${yellow}
-    fi
-  
-    if [ ${DAYS_TO_END} -lt ${REDWHENLESSTHANDAYS} ]
-    then
-      COLOR=${red}
-    fi
-  
-  fi
-  
-  echo "EXPIRES: ${COLOR}${DATE_END}${reset}" 
-  
+    days=$((seconds / 86400))
 fi
+color='' reset=''
+if [[ -t 1 && ! ${NO_COLOR+x} && -n ${TERM:-} && ${TERM:-} != dumb ]] && command -v tput >/dev/null; then
+    color_index=$COLOR_GREEN
+    ((days < 90)) && color_index=$COLOR_YELLOW
+    ((days < 30)) && color_index=$COLOR_RED
+    if color=$(tput setaf "$color_index" 2>/dev/null) && reset=$(tput sgr0 2>/dev/null); then
+        :
+    else
+        color='' reset=''
+    fi
+fi
+printf 'EXPIRES: %s%s%s\nDAYS REMAINING: %s\n' "$color" "$expires" "$reset" "$days"

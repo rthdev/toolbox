@@ -1,83 +1,83 @@
 # Toolbox
 
-Bash and Python scripts for Linux administration, automation, and OpenShift management.
+Small command-line helpers for Linux administration, troubleshooting and OpenShift.
+Commands intentionally have no `.sh` or `.py` extension.
 
-A collection of helpers for repetitive tasks, troubleshooting, and day-to-day operations. Scripts are designed to be small, readable, and easy to adapt.
+## Commands
 
-## Repository structure
+| Command | Purpose | Main runtime dependencies |
+| --- | --- | --- |
+| [`ced`](linux/ced) | Quick TLS certificate expiration summary | Bash, OpenSSL, GNU coreutils |
+| [`certinfo`](linux/certinfo) | TLS certificate CN, issuer, expiration and SANs | Bash, OpenSSL, GNU coreutils |
+| [`lsswap`](linux/lsswap) | Top processes by swap usage in MiB | Bash, Linux `/proc`, awk, coreutils |
+| [`pls`](linux/pls) | Container owner/name hints from visible conmon processes | Bash, procps `ps`, text utilities |
+| [`kdf`](openshift/kdf) | Disk-free report for all PVCs and running pod mounts in a namespace | Bash, `kubectl`, jq, container `df` |
+| [`ocprems`](openshift/ocprems) | API-removal request counts and recent callers | Bash, `oc`, jq |
 
-```text
-toolbox/
-├── linux/          # Linux administration and troubleshooting
-├── openshift/      # OpenShift administration and cluster utilities
-├── lib/            # Shared functions and modules
-├── docs/           # Usage notes and examples
-└── README.md
-```
-
-## Requirements
-
-Requirements vary by script. Common dependencies include:
-
-- **Bash** or **Python 3**
-- **OpenShift CLI (`oc`)** for OpenShift scripts
-- **jq** for scripts that process JSON
-- Access to the target systems or cluster with the necessary permissions
-
-Check each script’s documentation for specific dependencies and supported versions.
+See the [command guide](docs/commands.md) for options, examples, dependencies,
+permissions, exit codes and limitations.
 
 ## Getting started
 
-Clone the repository:
-
 ```bash
-git clone https://github.com/<your-username>/toolbox.git
+git clone https://github.com/rthdev/toolbox.git
 cd toolbox
+./linux/certinfo --help
+./linux/lsswap
 ```
 
-Review the script and its prerequisites before running it. Invoke Bash and Python scripts directly with their interpreter:
+The Bash commands are self-contained: copy an individual command to your preferred
+location once its external dependencies are installed. No sibling scripts or shared
+libraries are required. Run the executable directly or with its interpreter:
 
 ```bash
-bash linux/<script-name>.sh
-python3 linux/<script-name>.py
+bash linux/certinfo example.com:443
 ```
 
-> Replace the placeholders above with your GitHub username and an actual script name.
+This command makes a TLS connection. Install runtime dependencies appropriate to
+the commands you use; there is no repository-wide runtime package installation.
 
-## Working with OpenShift
+## Layout
 
-Log in to the intended cluster using your normal authentication workflow. Before running a script, verify your current context, API endpoint, identity, and project:
+```text
+linux/                 Linux and certificate commands
+openshift/             Cluster commands
+docs/commands.md       Command reference and operational limits
+tests/                 Offline regression tests and loopback TLS integration
+.github/workflows/     Pull-request validation
+Makefile               Local syntax, lint and test entry points
+requirements-dev.txt   Pinned development tools
+CONTRIBUTING.md        Development and branch/PR workflow
+```
+
+## Operational safety
+
+- Inspect scripts and test in a non-production environment before operational use.
+- Verify the target host, cluster, identity and namespace. Cluster tools use your
+  existing CLI credentials; they do not log in or switch contexts for you.
+- `kdf` executes `df` inside a container. `ocprems` reads cluster-scoped API request
+  data. Neither needs a blanket cluster-admin grant; see the permission notes.
+- Certificate inspection is **not** certificate-chain or hostname verification.
+  Successful output does not establish that an endpoint is trusted.
+- Do not commit credentials, tokens, private keys or kubeconfig files.
+
+Before cluster operations, for example:
 
 ```bash
 oc config current-context
 oc whoami --show-server
 oc whoami
 oc project
+# For kdf, also confirm the context used by kubectl:
+kubectl config current-context
 ```
 
-Use the least privileges needed for the task. A script may operate beyond the current project, so review its scope before execution.
+## Development
 
-## Safety
+See [CONTRIBUTING.md](CONTRIBUTING.md) for environment setup and `make check`.
+Tests require no real cluster or internet connection, but local TLS integration
+uses loopback sockets. Dependency installation and CI runner setup require network
+access. Every change starts on a new branch and is submitted as a PR to `main`;
+never write directly to `main`.
 
-**Review scripts before running them, especially against production systems.**
-
-- Test in a non-production environment first.
-- Confirm the target host, cluster, project, and resources.
-- Check whether the script changes or deletes anything.
-- Use dry-run options where available; do not assume every script supports them.
-- Back up important data and configuration before disruptive operations.
-- Never commit passwords, tokens, kubeconfig files, or other credentials.
-
-## Script conventions
-
-New scripts should:
-
-- Have a clear, descriptive filename.
-- Explain their purpose, usage, dependencies, and side effects.
-- Validate required arguments and dependencies.
-- Provide useful error messages and meaningful exit codes.
-- Avoid hard-coded credentials and environment-specific values.
-- Document required permissions and the scope of any changes.
-- Request confirmation for destructive actions where practical.
-
-A license has not yet been selected.
+A licence has not yet been selected.

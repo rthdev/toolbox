@@ -1,60 +1,114 @@
 #!/bin/bash
-# Notes:
-#   - Lists CN, SANs and Expiry date of certificate
-#   - should've been done in python, but it was quick and dirty.
-
-
-########################
-# Global Constans and Vars
-########################
-EXIT_CODE=0
-DEFAULT_PORT=443
-
-
-
-########################
-# Function definitions
-########################
-
-function print_usage {
-        echo "Usage: $(basename $0) [host:port]" 2>&1
+set -o pipefail
+# Keep TLS helpers local so this command can be copied independently.
+tls_usage() {
+    printf 'Usage: %s [--timeout SECONDS] [--servername NAME] HOST[:PORT]\n' "${0##*/}"
+    printf '%s\n' 'Target: domain name or IPv4 address. Port defaults to 443; timeout to 10 seconds.'
+    printf '%s\n' 'SECONDS is an integer from 1 to 999999 (plus a 1-second kill grace).'
+    printf '%s\n' 'DNS targets send SNI; IP targets do not. --servername NAME overrides SNI.'
+    printf '%s\n' 'Inspect only: self-signed and expired certificates are accepted.'
+    printf '%s\n' 'Exit codes: 0 success, 1 operational failure, 2 usage error.'
 }
 
+tls_bad_usage() {
+    printf '%s: %s\n' "${0##*/}" "$1" >&2
+    tls_usage >&2
+    exit 2
+}
 
-########################
-# Main Program
-########################
-if [[ ${#} -eq 0 ]]; then
-   print_usage
-   EXIT_CODE=1
-   exit ${EXIT_CODE}
-fi
+tls_args() {
+    TLS_TIMEOUT=10
+    TLS_SERVERNAME=''
+    local target='' port=443
+    while (($#)); do
+        case $1 in
+            -h|--help) tls_usage; exit 0 ;;
+            --timeout|--servername)
+                (($# >= 2)) || tls_bad_usage "missing value for $1"
+                if [[ $1 == --timeout ]]; then
+                    if [[ ! $2 =~ ^[0-9]{1,6}$ ]] || ((10#$2 == 0)); then
+                        tls_bad_usage 'invalid timeout'
+                    fi
+                    TLS_TIMEOUT=$((10#$2))
+                else
+                    [[ $2 =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]*$ ]] || tls_bad_usage 'invalid servername'
+                    TLS_SERVERNAME=$2
+                fi
+                shift 2 ;;
+            --)
+                shift
+                if [[ -n $target ]] || (($# != 1)); then
+                    tls_bad_usage 'expected one target'
+                fi
+                target=$1
+                shift ;;
+            -*) tls_bad_usage "unknown option: $1" ;;
+            *) [[ -z $target ]] || tls_bad_usage 'expected one target'; target=$1; shift ;;
+        esac
+    done
+    [[ -n $target ]] || tls_bad_usage 'missing target'
+    if [[ $target =~ ^([a-zA-Z0-9_][a-zA-Z0-9_.-]*)(:([0-9]+))?$ ]]; then
+        TLS_HOST=${BASH_REMATCH[1]}
+        [[ -z ${BASH_REMATCH[2]} ]] || port=${BASH_REMATCH[3]}
+        TLS_CONNECT=$TLS_HOST
+    else
+        tls_bad_usage 'expected a domain name or IPv4 address, optionally followed by :PORT'
+    fi
+    if [[ ! $port =~ ^[0-9]{1,5}$ ]] || ((10#$port < 1 || 10#$port > 65535)); then
+        tls_bad_usage 'invalid port'
+    fi
+    TLS_PORT=$((10#$port))
+    TLS_CONNECT+=":$TLS_PORT"
+}
 
-hostport=$1
+tls_error() {
+    printf '%s: %s\n' "${0##*/}" "$*" >&2
+    exit 1
+}
 
-host=$(echo $1 | awk -F":" '{ print $1 }')
-port=$(echo $1 | awk -F":" '{ print $2 }')
+tls_fetch() {
+    local dep status=0
+    for dep in openssl timeout mktemp; do
+        command -v "$dep" >/dev/null || tls_error "missing dependency: $dep"
+    done
+    local -a sni=(-noservername)
+    if [[ -n $TLS_SERVERNAME ]]; then
+        sni=(-servername "$TLS_SERVERNAME")
+    elif [[ ! $TLS_HOST =~ ^[0-9.]+$ ]]; then
+        sni=(-servername "$TLS_HOST")
+    fi
+    TLS_WORK=$(mktemp -d "${TMPDIR:-/tmp}/tls.XXXXXXXX") || tls_error 'cannot create temporary directory'
+    trap 'rm -rf -- "$TLS_WORK"' EXIT
+    trap 'exit 1' HUP INT TERM
+    timeout --kill-after=1 "$TLS_TIMEOUT" openssl s_client -4 \
+        -connect "$TLS_CONNECT" "${sni[@]}" -showcerts </dev/null \
+        >"$TLS_WORK/peer" 2>"$TLS_WORK/diagnostics" || status=$?
+    if ((status == 124 || status == 137)); then
+        tls_error "connection to $TLS_CONNECT timed out after $TLS_TIMEOUT seconds"
+    fi
+    if ((status != 0)); then
+        cat "$TLS_WORK/diagnostics" >&2
+        tls_error "TLS connection to $TLS_CONNECT failed (status $status)"
+    fi
+}
 
-if [ "${port}" == "" ]
-then
-  port=${DEFAULT_PORT}
-fi
-
-echo "Host: ${host}"
-echo "Port: ${port}"
-echo "--"
-cert=$(true | openssl s_client -connect ${host}:${port} -showcerts 2>&1 | openssl x509 -noout -text)
-cn=$(echo "${cert}" | grep "Subject: CN" | awk -F"=" '{ print $2 }' | sed -e 's/^[ \t]*//')
-san=$(echo "${cert}" | grep DNS: | tr ',' '\n' | awk -F":" '{ print $2 }')
-expires=$(echo "${cert}" | grep "Not After" | awk -F":" '{ print $2 ":" $3 ":" $4}' | sed -e 's/^[ \t]*//')
-issuer=$(echo "${cert}" | grep "Issuer:" | sed -e 's/Issuer://' | sed -e 's/^[ \t]*//')
-
-echo "CN: ${cn}"
-echo "Issuer: ${issuer}"
-echo
-echo "Expires: ${expires}"
-echo
-echo "SAN(s):"
-echo "${san}"
-
-exit ${EXIT_CODE}
+export LC_ALL=C
+tls_args "$@"
+for dep in sed tr; do
+    command -v "$dep" >/dev/null || tls_error "missing dependency: $dep"
+done
+tls_fetch
+subject=$(openssl x509 -in "$TLS_WORK/peer" -noout -subject \
+    -nameopt sep_multiline,sname,esc_2253,esc_ctrl,esc_msb,utf8) || tls_error 'cannot parse certificate subject'
+# OpenSSL escapes literal plus signs; only the spaced RDN separator is split.
+cn=$(printf '%s\n' "$subject" | sed 's/ + /\n/g' | sed -n 's/^ *CN *= *//p') || tls_error 'cannot parse certificate CN'
+issuer=$(openssl x509 -in "$TLS_WORK/peer" -noout -issuer -nameopt RFC2253) || tls_error 'cannot parse certificate issuer'
+expires=$(openssl x509 -in "$TLS_WORK/peer" -noout -enddate) || tls_error 'cannot parse certificate expiry'
+san=$(openssl x509 -in "$TLS_WORK/peer" -noout -ext subjectAltName 2>"$TLS_WORK/parse-errors") || {
+    cat "$TLS_WORK/parse-errors" >&2
+    tls_error 'cannot parse certificate SANs'
+}
+san=$(printf '%s\n' "$san" | tr ',' '\n' | sed -n -e 's/^ *DNS:/DNS:/p' -e 's/^ *IP Address:/IP:/p') || tls_error 'cannot parse certificate SANs'
+printf 'Host: %s\nPort: %s\n--\n' "$TLS_HOST" "$TLS_PORT"
+printf 'CN: %s\nIssuer: %s\n\nExpires: %s\n\nSAN(s):\n%s\n' \
+    "${cn:-(none)}" "${issuer#issuer=}" "${expires#notAfter=}" "${san:-(none)}"

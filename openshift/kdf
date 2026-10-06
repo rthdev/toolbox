@@ -1,55 +1,96 @@
 #!/bin/bash
-# Kubernetes Disk Free - kdf
+# Report filesystem usage for every PVC in one namespace.
+set -uo pipefail
 
-pv_disk_free () {
-  pvc=$1
-
-  if [[ -z "${pvc}" ]]; then
-    echo "ERROR: no pvc specified, exiting..."
-    exit 1
-  fi
-  
-  kubectl get pvc ${pvc} > /dev/null 2>&1
-  if [[ $? -ne 0 ]]; then
-    echo "ERROR: no pvc with name ${pvc} found, exiting..."
-    exit 1
-  fi
-
-  pod=$(kubectl get pod -o json | jq -r "
-    .items[] |
-    select(.spec.volumes[]?.persistentVolumeClaim.claimName==\"${pvc}\") |
-            .metadata.name" | head -1)
-  if [ -z "${pod}" ]; then
-    echo "WARNING: No pods found"
-  else
-    volname=$(kubectl get pod ${pod} -o json | jq -r "
-      .spec.volumes[] |
-      select(.persistentVolumeClaim.claimName==\"${pvc}\") |
-      .name")
-    
-    mntpath=$(kubectl get pod ${pod} -o json | jq -r "
-      .spec.containers[].volumeMounts[] |
-      select(.name==\"${volname}\") |
-      .mountPath")
-    
-    kubectl exec ${pod} -- df -h ${mntpath}
-  fi
+usage() {
+    printf '%s\n' 'Usage: kdf [-n NAMESPACE|--namespace NAMESPACE]' \
+        'Report all PVCs in the selected or current-context namespace.' \
+        'Requires: kubectl, jq; container df supporting -P -h and --.' \
+        'Exit status: 0 success, 1 operational failure, 2 usage error.'
 }
-
-if [[ -n $1 ]]; then
-  pv_disk_free $1
-else
-  pvc_list=$(kubectl get pvc --no-headers | awk '{ print $1 }')
-
-  if [[ $? -ne 0 ]]; then
-    echo "ERROR: no pvcs found, exiting..."
-    exit 1
-  fi
-
-  for cur_pvc in ${pvc_list}
-  do
-    echo "${cur_pvc}: "
-    pv_disk_free $cur_pvc
-    echo
-  done
-fi
+usage_error() { printf 'kdf: %s\n' "$*" >&2; usage >&2; exit 2; }
+namespace=()
+while (($#)); do
+    case "$1" in
+        -h|--help) (($# == 1)) || usage_error 'help takes no arguments'; usage; exit 0 ;;
+        -n|--namespace)
+            if (($# < 2)) || [[ ! $2 =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]]; then
+                usage_error "$1 requires a namespace name"
+            fi
+            ((${#namespace[@]} == 0)) || usage_error 'namespace specified twice'
+            namespace=(-n "$2"); shift 2 ;;
+        *) usage_error "unexpected argument: $1" ;;
+    esac
+done
+for dependency in kubectl jq; do
+    command -v "$dependency" >/dev/null 2>&1 || {
+        printf 'kdf: required command not found: %s\n' "$dependency" >&2
+        exit 1
+    }
+done
+pvcs=$(kubectl "${namespace[@]}" get pvc -o json) || exit 1
+pods=$(kubectl "${namespace[@]}" get pods -o json) || exit 1
+for snapshot in "$pvcs" "$pods"; do
+    jq -e 'type == "object" and ((.items // []) | type == "array")' <<< "$snapshot" >/dev/null || {
+        printf 'kdf: invalid JSON resource list\n' >&2
+        exit 1
+    }
+done
+# Build rows once; use NUL-delimited fields below to preserve exec arguments.
+rows=$(printf '%s\n%s\n' "$pvcs" "$pods" | jq -cs '
+    .[0] as $pvcs | .[1] as $pods |
+    [($pvcs.items // [])[] | select(.metadata.name | type == "string")] |
+    sort_by(.metadata.name)[] | .metadata.name as $pvc | .spec.volumeMode as $mode |
+    [($pods.items // [])[] | select($mode != "Block" and .status.phase == "Running") as $pod |
+     $pod.spec.volumes[]? | select(.persistentVolumeClaim.claimName == $pvc) | .name as $volume |
+     $pod.spec.containers[]? as $container |
+     select($pod.status.containerStatuses == null or
+         any($pod.status.containerStatuses[]; .name == $container.name and .state.running != null)) |
+     $container.volumeMounts[]? | select(.name == $volume) |
+     if (.mountPath | type == "string" and startswith("/") and (contains("\u0000") | not))
+     then . else error("invalid mount path") end |
+     {pvc: $pvc, pod: $pod.metadata.name, container: $container.name, path: .mountPath}] |
+    unique_by([.pod, .path]) |
+    if length == 0 then [{pvc: $pvc, pod: "", container: "", path: ""}] else . end |
+    .[]') || exit 1
+# Keep structured rows until every column width is known (paths may contain |).
+table=('["PVC Name", "Pod Name", "Filesystem", "Size", "Used", "Avail", "Use%", "Mounted on"]')
+status=0
+while IFS= read -r row; do
+    [[ -n $row ]] || continue
+    fields=()
+    while IFS= read -r -d '' field; do fields+=("$field"); done < <(
+        jq -j '[.pvc, .pod, .container, .path][] | ., "\u0000"' <<< "$row")
+    pvc=${fields[0]} pod=${fields[1]} container=${fields[2]} path=${fields[3]}
+    if [[ -z $pod ]]; then
+        report=$(jq -cn --arg pvc "$pvc" '[$pvc, "", "", "", "", "", "", ""]') || exit 1
+        table+=("$report")
+        continue
+    fi
+    if ! output=$(kubectl "${namespace[@]}" exec "$pod" -c "$container" -- df -P -h -- "$path"); then
+        printf 'kdf: %s: df failed in pod %s at %s\n' "$pvc" "$pod" "$path" >&2
+        status=1
+        continue
+    fi
+    # Match the first numeric column group, preserving spaces in mountpoints.
+    report=$(jq -Rc --arg pvc "$pvc" --arg pod "$pod" '
+        def number: "[0-9]+(?:[.][0-9]+)?[A-Za-z]*";
+        capture("^(?<filesystem>.+?)\\s+(?<size>" + number + ")\\s+(?<used>" + number +
+            ")\\s+(?<avail>-?" + number + ")\\s+(?<use>[0-9]+%)\\s+(?<mount>.+)$") |
+        [$pvc, $pod, .filesystem, .size, .used, .avail, .use, .mount]
+        ' <<< "$output") || { status=1; continue; }
+    if [[ -n $report ]]; then
+        table+=("$report")
+    else
+        printf 'kdf: %s: invalid df output in pod %s at %s\n' "$pvc" "$pod" "$path" >&2
+        status=1
+    fi
+done <<< "$rows"
+printf '%s\n' "${table[@]}" | jq -sr '
+    (transpose | map(map(length) | max)) as $widths |
+    .[] | to_entries | map(
+        (" " * ($widths[.key] - (.value | length))) as $padding |
+        if .key >= 3 and .key <= 6 then $padding + .value else .value + $padding end) |
+    join("  ")
+' || status=1
+exit "$status"
