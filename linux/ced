@@ -1,5 +1,9 @@
 #!/bin/bash
 # Certificate Expiration Date: inspection only, not trust validation.
+readonly COLOR_RED=1
+readonly COLOR_YELLOW=3
+readonly COLOR_GREEN=2
+
 # Keep TLS helpers local so this command can be copied independently.
 tls_usage() {
     printf 'Usage: %s [--timeout SECONDS] [--servername NAME] HOST[:PORT]\n' "${0##*/}"
@@ -109,10 +113,10 @@ else
 fi
 color='' reset=''
 if [[ -t 1 && ! ${NO_COLOR+x} && -n ${TERM:-} && ${TERM:-} != dumb ]] && command -v tput >/dev/null; then
-    index=2
-    ((days < 90)) && index=3
-    ((days < 30)) && index=1
-    if color=$(tput setaf "$index" 2>/dev/null) && reset=$(tput sgr0 2>/dev/null); then
+    color_index=$COLOR_GREEN
+    ((days < 90)) && color_index=$COLOR_YELLOW
+    ((days < 30)) && color_index=$COLOR_RED
+    if color=$(tput setaf "$color_index" 2>/dev/null) && reset=$(tput sgr0 2>/dev/null); then
         :
     else
         color='' reset=''
