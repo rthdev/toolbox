@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# List files whose first line contains an Ansible Vault header.
+
+set -o pipefail
+
+usage() {
+    printf 'Usage: %s [-r] [START_PATH]\n' "${0##*/}"
+    printf '       %s [-h|--help]\n' "${0##*/}"
+}
+
+recursive=false
+
+while (($# > 0)); do
+    case $1 in
+        -r|--recursive)
+            recursive=true
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            printf 'Error: unknown option: %s\n' "$1" >&2
+            usage >&2
+            exit 2
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+if (($# > 1)); then
+    printf 'Error: expected at most one starting path.\n' >&2
+    usage >&2
+    exit 2
+fi
+
+start_path=${1:-.}
+
+if [[ ! -e $start_path ]]; then
+    printf 'Error: path does not exist: %s\n' "$start_path" >&2
+    exit 1
+fi
+
+is_vault_file() {
+    local file=$1 first_line=''
+
+    [[ -f $file && -r $file ]] || return 1
+    IFS= read -r first_line < "$file" || [[ -n $first_line ]]
+    [[ $first_line == '$ANSIBLE_VAULT;'* ]]
+}
+
+if [[ -f $start_path ]]; then
+    is_vault_file "$start_path" && printf '%s\n' "$start_path"
+    exit 0
+fi
+
+if [[ ! -d $start_path ]]; then
+    printf 'Error: path is neither a regular file nor a directory: %s\n' "$start_path" >&2
+    exit 1
+fi
+
+find_args=("$start_path")
+if [[ $recursive == false ]]; then
+    find_args+=(-maxdepth 1)
+fi
+find_args+=(-type f -print0)
+
+while IFS= read -r -d '' file; do
+    if is_vault_file "$file"; then
+        printf '%s\n' "$file"
+    fi
+done < <(find "${find_args[@]}")
