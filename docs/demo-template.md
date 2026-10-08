@@ -17,12 +17,35 @@ additional dependencies and permissions. Prerequisites are printed, not checked.
 Use `explain 'text'` for audience-facing commentary and `run 'command'` for each
 command you want to approve. Ordinary Bash comments stay invisible.
 
+Additional helpers let you control presentation flow explicitly:
+
+| Helper | Behaviour |
+| --- | --- |
+| `section 'Title'` | Print a heading, without waiting or clearing. |
+| `explain 'Text'` | Print commentary, without waiting. |
+| `run 'command'` | Show the command, wait for Enter, then execute it. |
+| `wait` | Wait silently for Enter before continuing; q/EOF quits. |
+| `clean` | Immediately clear the visible screen, without waiting. |
+
+Use `wait; clean` when you want time to discuss output before clearing it.
+Use `clean` alone when you want to clear immediately. `clean` emits ANSI
+clear-screen and cursor-home sequences on a non-dumb terminal; it does not
+request scrollback erasure. Exact scrollback behaviour depends on the terminal.
+With redirected output or an unset/empty/dumb `TERM`, it does nothing.
+
+The `wait` helper deliberately shadows Bash's built-in command of the same name.
+Use `builtin wait` (or `builtin wait "$pid"`) to wait for background jobs.
+
 ```bash
 demo() {
+    section 'Variables and pipelines'
     explain 'Set up a value, then use it in the next command.'
     run 'export GREETING="Hello, demo"'
     run 'printf "%s\n" "$GREETING" | sort'
 
+    wait
+    clean
+    section 'Writing files'
     explain 'This writes a file in the current directory.'
     run 'printf "%s\n" "$GREETING" > demo.txt'
     run 'cat demo.txt'
@@ -34,9 +57,13 @@ EOF'
 }
 ```
 
-Each `run` displays its literal snippet, waits for **Enter**, then executes it.
-Type **q** (or **Q**) and Enter to quit. Other input repeats the prompt and is
-never evaluated. End-of-input quits without executing the pending command.
+Controls appear once in the initial header, not before every command. Each `run`
+displays `$ command` and waits at the end of the line for **Enter**, then executes
+it. Multiline snippets display `>` before continuation lines; these prefixes are
+not part of the executed code. Runner input is not echoed in a terminal.
+Type **q** (or **Q**) and Enter to quit from `run` or `wait`. Other input shows a
+brief reminder and waits again; it is never evaluated. End-of-input quits without
+executing the pending command.
 Interactive commands read from the same stdin as the runner; run demos directly
 in a terminal rather than piping a prefilled list of answers.
 
@@ -62,8 +89,11 @@ is displayed and waits, leaving previous output visible.
 - The shipped example is read-only. The commented redirection example would
   create or overwrite `demo.txt` if enabled. Nothing rolls back or cleans up
   executed commands when you quit; add explicit cleanup steps if needed.
-- Output is deliberately plain text, with no colour dependencies, clearing,
-  animation, replay or automatic execution mode.
+- Commands and section headings are bold; commentary and failure statuses are dim.
+  Command output is untouched. Styling is disabled for redirected output, an
+  unset/empty/dumb `TERM`, or any set `NO_COLOR` (including an empty value).
+  `NO_COLOR` disables styling, not an explicit `clean` on a suitable terminal.
+  There is no automatic clearing, animation, replay or automatic execution mode.
 - Completion, q and EOF return 0, including intentional command failures.
   Invalid CLI arguments return 2. `-h` / `--help` prints local usage without
   executing the demo. An explicit `exit N` in a snippet retains that status.
