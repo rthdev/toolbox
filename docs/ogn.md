@@ -38,6 +38,10 @@ as the displayed `N/A` string.
 
 ## Failures and empty results
 
+Exit status is **0** for a successful report/help and **2** for invalid arguments.
+Missing dependencies return **127**; `oc` and `jq` failures preserve their nonzero
+status rather than mapping every operational failure to 1.
+
 Collection and JSON processing complete before any report is printed.
 An `oc` or `jq` failure returns nonzero, preserves diagnostics on stderr,
 and emits no partial table or misleading header on stdout. Invalid node-list
