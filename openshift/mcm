@@ -1,343 +1,528 @@
 #!/usr/bin/env python3
-"""
-mcm - Multi Cluster Management
-
-multi-cluster OpenShift CLI with:
-- Parallel execution
-- Clean login handling (no prompt collisions)
-- Single password prompt per user
-- Sorted output
-- Logout support
-"""
-
+"""Managed multi-cluster OpenShift commands (POSIX, Python 3.9+)."""
 from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import threading
+import copy
+from contextlib import contextmanager
+import fcntl
+import getpass
+import math
+import os
+import pty
+import re
+import select
+import signal
+import termios
+import time
+from pathlib import Path
 import subprocess
 import sys
+import tempfile
+import stat
+import warnings
+from urllib.parse import urlsplit
+
 import yaml
-import getpass
-import os
-
-from dataclasses import dataclass, asdict
-from pathlib import Path
-from typing import List, Dict
-
-CONFIG_PATH = Path.home() / ".mcm.yaml"
-DEFAULT_TIMEOUT = 30
-DEFAULT_WORKERS = 8
-
-password_cache: Dict[str, str] = {}
 
 
-# --------------------------------------------------
-# Data Model
-# --------------------------------------------------
-
-@dataclass
-class Cluster:
-    name: str
-    server: str
-    kubeconfig: str
-    username: str
+def text(value, label):
+    if not isinstance(value, str) or not value.strip() or any(ord(c) < 32 or ord(c) == 127 for c in value):
+        raise ValueError(label + ' must be a nonempty string without control characters')
+    return value
 
 
-# --------------------------------------------------
-# Cluster Manager
-# --------------------------------------------------
-
-class ClusterManager:
-
-    def __init__(self, config_path: Path):
-        self.config_path = config_path
-        self.clusters: List[Cluster] = []
-        self._load()
-
-    def _load(self):
-        if not self.config_path.exists():
-            return
-
-        with open(self.config_path) as f:
-            data = yaml.safe_load(f) or {}
-
-        self.clusters = [Cluster(**c) for c in data.get("clusters", [])]
-
-    def _save(self):
-        with open(self.config_path, "w") as f:
-            yaml.safe_dump({"clusters": [asdict(c) for c in self.clusters]}, f)
-
-    def list(self) -> List[Cluster]:
-        return self.clusters
-
-    def add(self, name, server, kubeconfig, username):
-        if any(c.name == name for c in self.clusters):
-            raise ValueError("Cluster already exists")
-
-        self.clusters.append(
-            Cluster(name=name, server=server, kubeconfig=kubeconfig, username=username)
-        )
-        self._save()
-
-    def remove(self, name):
-        self.clusters = [c for c in self.clusters if c.name != name]
-        self._save()
+def expanded_path(value):
+    try:
+        return Path(value).expanduser()
+    except RuntimeError:
+        raise ValueError('path contains an unknown home directory') from None
 
 
-# --------------------------------------------------
-# Login Manager
-# --------------------------------------------------
-
-class LoginManager:
-
-    @staticmethod
-    def is_logged_in(cluster: Cluster) -> bool:
-        env = os.environ.copy()
-        env["KUBECONFIG"] = cluster.kubeconfig
-
-        result = subprocess.run(
-            ["oc", "whoami"],
-            env=env,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-
-        return result.returncode == 0
-
-    @staticmethod
-    def get_password(username: str) -> str:
-        if username in password_cache:
-            return password_cache[username]
-
-        password = getpass.getpass(f"Password for '{username}': ")
-        password_cache[username] = password
-        return password
-
-    @staticmethod
-    def login(cluster: Cluster):
-        password = LoginManager.get_password(cluster.username)
-
-        env = os.environ.copy()
-        env["KUBECONFIG"] = cluster.kubeconfig
-
-        result = subprocess.run(
-            [
-                "oc",
-                "login",
-                cluster.server,
-                "-u",
-                cluster.username,
-                "-p",
-                password,
-                "--insecure-skip-tls-verify=true",
-            ],
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-
-        if result.returncode != 0:
-            raise RuntimeError(result.stderr.strip())
-
-    @staticmethod
-    def logout(cluster: Cluster):
-        env = os.environ.copy()
-        env["KUBECONFIG"] = cluster.kubeconfig
-        subprocess.run(["oc", "logout"], env=env)
+def private_path(value, base):
+    value = text(str(value) if isinstance(value, Path) else value, 'path')
+    if os.pathsep in value:
+        raise ValueError('path must be one file, not a KUBECONFIG list')
+    path = Path(os.path.abspath(base / expanded_path(value)))
+    for component in (path, *path.parents):
+        if component.is_symlink():
+            raise ValueError('symlink paths are not supported: ' + str(path))
+    if path.exists():
+        info = path.stat()
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise ValueError('path must be a regular, unshared file: ' + str(path))
+    if path == Path.home() / '.kube/config':
+        raise ValueError('use a dedicated kubeconfig, not ~/.kube/config')
+    return path
 
 
-# --------------------------------------------------
-# Executor
-# --------------------------------------------------
+def validate_config(data, config_path):
+    if not isinstance(data, dict) or set(data) - {'clusters', 'credential_groups'}:
+        raise ValueError('config must be a mapping with clusters and credential_groups')
+    groups = data.get('credential_groups', {})
+    clusters = data.get('clusters', [])
+    if not isinstance(groups, dict) or not isinstance(clusters, list):
+        raise ValueError('credential_groups must be a mapping and clusters a list')
+    normalized = {}
+    for name, value in groups.items():
+        text(name, 'group name')
+        if isinstance(value, dict):
+            if set(value) != {'username'}:
+                raise ValueError('credential group accepts only username')
+            value = value['username']
+        normalized[name] = text(value, 'username')
+    names, paths = set(), {config_path, Path(str(config_path) + '.lock')}
+    result = []
+    for item in clusters:
+        if not isinstance(item, dict) or set(item) - {'name', 'server', 'kubeconfig', 'credential_group', 'username', 'certificate_authority'}:
+            raise ValueError('invalid cluster fields')
+        cluster = dict(item)
+        if 'username' in cluster:
+            if 'credential_group' in cluster:
+                raise ValueError('use credential_group or legacy username, not both')
+            name = 'legacy:' + text(cluster.get('name'), 'name')
+            if name in normalized:
+                raise ValueError('reserved legacy group collision')
+            normalized[name] = text(cluster.pop('username'), 'username')
+            cluster['credential_group'] = name
+        for field in ('name', 'server', 'kubeconfig', 'credential_group'):
+            text(cluster.get(field), field)
+        if cluster['name'] in names:
+            raise ValueError('duplicate cluster name')
+        names.add(cluster['name'])
+        server = urlsplit(cluster['server'])
+        if (server.scheme != 'https' or not server.hostname or server.username or server.password
+                or server.query or server.fragment or server.path not in ('', '/')
+                or any(c.isspace() for c in cluster['server'])):
+            raise ValueError('server must be an HTTPS origin without credentials, query or path')
+        _ = server.port
+        if cluster['credential_group'] not in normalized:
+            raise ValueError('unknown credential_group: ' + cluster['credential_group'])
+        path = private_path(cluster['kubeconfig'], config_path.parent)
+        if path in paths:
+            raise ValueError('shared or reserved kubeconfig path')
+        paths.add(path)
+        cluster['kubeconfig'] = str(path)
+        if 'certificate_authority' in cluster:
+            ca = expanded_path(text(cluster['certificate_authority'], 'certificate_authority'))
+            ca = (config_path.parent / ca).resolve()
+            if not ca.is_file():
+                raise ValueError('certificate_authority must be an existing file')
+            cluster['certificate_authority'] = str(ca)
+        result.append(cluster)
+    if any(Path(c.get('certificate_authority', '/')) in paths for c in result):
+        raise ValueError('CA path must not be a writable registration or kubeconfig path')
+    return {'credential_groups': normalized, 'clusters': result}
 
-class CommandExecutor:
 
-    def __init__(self, clusters: List[Cluster], workers: int):
-        self.clusters = clusters
-        self.workers = workers
+def read_yaml(path):
+    try:
+        return yaml.safe_load(path.read_text())
+    except yaml.YAMLError:
+        raise ValueError('invalid YAML in ' + str(path)) from None
 
-    def _check_cluster(self, cluster: Cluster):
-        """
-        First pass: check login status only
-        """
+
+def load_config(path):
+    data = read_yaml(path) if path.exists() else {}
+    return validate_config(data, path)
+
+
+@contextmanager
+def config_lock(path):
+    """Hold a stable sidecar lock across the entire read-modify-replace."""
+    lock = private_path(Path(str(path) + '.lock'), Path.cwd())
+    lock.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(lock, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def edit_config(args):
+    with config_lock(args.config):
+        data = load_config(args.config)
+        clusters = data['clusters']
+        if args.action == 'remove':
+            if not any(c['name'] == args.name for c in clusters):
+                raise ValueError('unknown cluster: ' + args.name)
+            data['clusters'] = [c for c in clusters if c['name'] != args.name]
+        else:
+            group = args.credential_group or 'legacy:' + args.name
+            groups = data['credential_groups']
+            if args.user:
+                if group in groups and groups[group] != args.user:
+                    raise ValueError('credential group already has a different username')
+                groups[group] = args.user
+            if group not in groups:
+                raise ValueError('new credential group requires --user')
+            cluster = {'name': args.name, 'server': args.server, 'kubeconfig': args.kubeconfig,
+                       'credential_group': group}
+            if args.certificate_authority:
+                cluster['certificate_authority'] = args.certificate_authority
+            clusters.append(cluster)
+        atomic_yaml(args.config, validate_config(data, args.config))
+    return 0
+
+
+def atomic_yaml(path, data):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, temporary = tempfile.mkstemp(dir=path.parent, prefix='.' + path.name)
+    try:
+        with os.fdopen(fd, 'w') as stream:
+            yaml.safe_dump(data, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def kill_group(process):
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+# Command workers register their groups so an interrupt also stops descendants.
+ACTIVE_PROCESSES = set()
+PROCESS_LOCK = threading.Lock()
+CANCELLED = threading.Event()
+
+
+def run_process(command, env, timeout=30):
+    with PROCESS_LOCK:
+        if CANCELLED.is_set():
+            return subprocess.CompletedProcess(command, 130, '', 'Cancelled\n')
+        process = subprocess.Popen(command, shell=isinstance(command, str), env=env,
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, text=True, start_new_session=True)
+        ACTIVE_PROCESSES.add(process)
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+        return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+    except subprocess.TimeoutExpired:
+        kill_group(process)
+        stdout, stderr = process.communicate(timeout=2)
+        return subprocess.CompletedProcess(command, 124, stdout, stderr + '\nOperation timed out\n')
+    finally:
+        kill_group(process)
+        process.wait()
+        with PROCESS_LOCK:
+            ACTIVE_PROCESSES.discard(process)
+
+
+def oc_command(args, *command):
+    return ['oc', *command, f'--request-timeout={args.timeout:g}s']
+
+
+@contextmanager
+def prompt_deadline(seconds):
+    # Authentication runs on the main thread; bound even a blocked human prompt.
+    def expired(signum, frame):
+        raise ValueError('login timed out waiting for terminal input')
+
+    previous = signal.signal(signal.SIGALRM, expired)
+    signal.setitimer(signal.ITIMER_REAL, max(0.001, seconds))
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+def login_pty(command, env, password_for_group, timeout=30):
+    """oc's non-TTY password scanner truncates whitespace; use a private PTY.
+
+    Echo is disabled before spawning. Never relay authentication output: servers
+    and clients may echo credentials. Only send at the exact password prompt.
+    """
+    master, slave = pty.openpty()
+    attributes = termios.tcgetattr(slave)
+    attributes[3] &= ~(termios.ECHO | termios.ECHONL)
+    termios.tcsetattr(slave, termios.TCSANOW, attributes)
+    process = None
+    try:
+        process = subprocess.Popen(command, env=env, stdin=slave, stdout=slave,
+                                   stderr=slave, start_new_session=True)
+        os.close(slave)
+        slave = None
+        deadline = time.monotonic() + timeout
+        output = b''
+        sent = False
+        while time.monotonic() < deadline:
+            if select.select([master], [], [], 0.05)[0]:
+                try:
+                    chunk = os.read(master, 4096)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                output = (output + chunk)[-8192:]
+                if any(marker in output.lower() for marker in
+                       (b'x509:', b'certificate signed by unknown authority', b'insecure connections?',
+                        b'use insecure connections', b'proceed insecurely')):
+                    raise ValueError('TLS certificate verification failed; configure a CA or explicitly opt in to insecure TLS')
+                if not sent and re.search(rb'(?:^|[\r\n])Password: *$', output):
+                    with prompt_deadline(deadline - time.monotonic()):
+                        password = password_for_group()
+                    if any(ord(char) < 32 or ord(char) == 127 for char in password):
+                        raise ValueError('password contains unsupported terminal control characters')
+                    os.write(master, (password + '\n').encode())
+                    sent = True
+            if process.poll() is not None:
+                break
+        if process.poll() is None:
+            process.wait(timeout=max(0.01, deadline - time.monotonic()))
+        if process.returncode:
+            raise ValueError('login failed (authentication output suppressed)')
+    except subprocess.TimeoutExpired:
+        raise ValueError('login timed out (authentication output suppressed)') from None
+    finally:
+        if process is not None:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
+        os.close(master)
+        if slave is not None:
+            os.close(slave)
+
+
+def named_entry(data, collection, name, field):
+    entries = data[collection]
+    if not isinstance(entries, list):
+        raise ValueError('invalid kubeconfig collection')
+    matches = [entry[field] for entry in entries if entry['name'] == name]
+    if len(matches) != 1 or not isinstance(matches[0], dict):
+        raise ValueError('missing or ambiguous kubeconfig context, cluster or user')
+    return matches[0]
+
+
+def session_config(cluster):
+    path = Path(cluster['kubeconfig'])
+    target = {'server': cluster['server']}
+    user = {}
+    context = {}
+    if path.exists():
+        data = read_yaml(path)
         try:
-            if not LoginManager.is_logged_in(cluster):
-                return {"cluster": cluster, "needs_login": True}
-            return {"cluster": cluster, "needs_login": False}
-        except Exception:
-            return {"cluster": cluster, "needs_login": True}
-
-    def _run(self, cluster: Cluster, command: str):
-
-        env = os.environ.copy()
-        env["KUBECONFIG"] = cluster.kubeconfig
-
-        try:
-            result = subprocess.run(
-                command,
-                shell=True,
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=DEFAULT_TIMEOUT,
-            )
-
-            return {
-                "cluster": cluster.name,
-                "stdout": result.stdout.strip(),
-                "stderr": result.stderr.strip(),
-                "success": result.returncode == 0,
-            }
-
-        except subprocess.TimeoutExpired:
-            return {
-                "cluster": cluster.name,
-                "stdout": "",
-                "stderr": "Timeout contacting cluster",
-                "success": False,
-            }
-
-        except Exception as e:
-            return {
-                "cluster": cluster.name,
-                "stdout": "",
-                "stderr": str(e),
-                "success": False,
-            }
-
-    def run(self, command: str):
-
-        # ---- Phase 1: check login state (parallel)
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=self.workers
-        ) as executor:
-
-            check_results = list(
-                executor.map(self._check_cluster, self.clusters)
-            )
-
-        # ---- Phase 2: login (sequential + grouped by user)
-        clusters_needing_login = [r["cluster"] for r in check_results if r["needs_login"]]
-
-        if clusters_needing_login:
-            print("\nLogin required for clusters:")
-
-            for c in sorted(clusters_needing_login, key=lambda x: x.name):
-                print(f" - {c.name} ({c.username})")
-
-            print()
-
-            for c in clusters_needing_login:
-                print(f"Logging into {c.name}...")
-                LoginManager.login(c)
-
-        # ---- Phase 3: run command (parallel)
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=self.workers
-        ) as executor:
-
-            results = list(
-                executor.map(lambda c: self._run(c, command), self.clusters)
-            )
-
-        # ---- Sort results
-        results.sort(key=lambda x: x["cluster"])
-
-        return results
+            context = named_entry(data, 'contexts', data['current-context'], 'context')
+            target = named_entry(data, 'clusters', context['cluster'], 'cluster')
+            user = named_entry(data, 'users', context['user'], 'user')
+            if target['server'].rstrip('/') != cluster['server'].rstrip('/'):
+                raise ValueError('cached server differs from registered server')
+        except (KeyError, TypeError, AttributeError):
+            raise ValueError('malformed kubeconfig; expected a selected context, cluster and user') from None
+        if set(user) - {'token'}:
+            raise ValueError('managed kubeconfigs support tokens only, not credential plugins or embedded passwords')
+        if 'token' in user and not isinstance(user['token'], str):
+            raise ValueError('session token must be a string')
+        if user.get('token'):
+            text(user['token'], 'session token')
+    for key in ('certificate-authority', 'certificate-authority-data'):
+        if key in target:
+            text(target[key], key)
+    target = {k: v for k, v in target.items()
+              if k in ('server', 'certificate-authority', 'certificate-authority-data')}
+    if cluster.get('certificate_authority'):
+        target.pop('certificate-authority-data', None)
+        target['certificate-authority'] = cluster['certificate_authority']
+    elif target.get('certificate-authority'):
+        target['certificate-authority'] = str((path.parent / target['certificate-authority']).resolve())
+    selected_context = {'cluster': 'mcm', 'user': 'mcm'}
+    if context.get('namespace'):
+        selected_context['namespace'] = text(context['namespace'], 'namespace')
+    return {'apiVersion': 'v1', 'kind': 'Config', 'current-context': 'mcm',
+            'clusters': [{'name': 'mcm', 'cluster': target}],
+            'contexts': [{'name': 'mcm', 'context': selected_context}],
+            'users': [{'name': 'mcm', 'user': user}]}
 
 
-# --------------------------------------------------
-# Output
-# --------------------------------------------------
-
-def print_table(results):
-
-    headers = ["Cluster", "Status", "Output"]
-
-    rows = []
-
-    for r in results:
-        status = "OK" if r["success"] else "ERROR"
-        output = (r["stdout"] or r["stderr"]).split("\n")[0]
-        rows.append([r["cluster"], status, output])
-
-    col_widths = [
-        max(len(str(row[i])) for row in ([headers] + rows))
-        for i in range(len(headers))
-    ]
-
-    def fmt(row):
-        return " | ".join(str(row[i]).ljust(col_widths[i]) for i in range(len(row)))
-
-    sep = "-+-".join("-" * w for w in col_widths)
-
-    print(fmt(headers))
-    print(sep)
-
-    for r in rows:
-        print(fmt(r))
+def prompt_password(group, username):
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter('error', getpass.GetPassWarning)
+            return getpass.getpass(f'Password for {group} ({username}): ')
+    except (getpass.GetPassWarning, EOFError):
+        raise ValueError('login needs an interactive terminal with password echo disabled') from None
 
 
-# --------------------------------------------------
-# CLI
-# --------------------------------------------------
+def execution_config(safe, insecure):
+    transient = copy.deepcopy(safe)
+    if insecure:
+        target = transient['clusters'][0]['cluster']
+        target.pop('certificate-authority', None)
+        target.pop('certificate-authority-data', None)
+        target['insecure-skip-tls-verify'] = True
+    return transient
+
+
+def execute(args, data):
+    failed = False
+    ready = []
+    passwords = {}
+    blocked_groups = set()
+    if args.insecure_skip_tls_verify:
+        print('WARNING: insecure TLS; verification disabled for: ' + ', '.join(c['name'] for c in data['clusters']), file=sys.stderr)
+    with tempfile.TemporaryDirectory(prefix='mcm-') as directory:
+        for index, cluster in enumerate(data['clusters']):
+            try:
+                safe = session_config(cluster)
+                atomic_yaml(cluster['kubeconfig'], safe)
+                path = Path(directory) / str(index)
+                atomic_yaml(path, execution_config(safe, args.insecure_skip_tls_verify))
+                env = dict(os.environ, KUBECONFIG=str(path))
+                result = run_process(oc_command(args, 'whoami'), env, args.timeout)
+                group = cluster['credential_group']
+                username = data['credential_groups'][group]
+                if args.action != 'logout' and result.returncode and any(text in (result.stdout + result.stderr).lower()
+                                             for text in ('unauthorized', 'you must be logged in', 'provide credentials')):
+                    if group in blocked_groups:
+                        raise ValueError('credential group blocked after unsuccessful login')
+
+                    def password_for_group():
+                        if group not in passwords:
+                            passwords[group] = prompt_password(group, username)
+                        # Conservatively block further attempts if anything fails after sending.
+                        blocked_groups.add(group)
+                        return passwords[group]
+
+                    login_pty(oc_command(args, 'login', cluster['server'], '--username', username),
+                              env, password_for_group, args.timeout)
+                    logged_in = session_config(dict(cluster, kubeconfig=str(path)))
+                    # Trust settings come from registration/cache, never an insecure login.
+                    logged_in['clusters'] = safe['clusters']
+                    atomic_yaml(path, execution_config(logged_in, args.insecure_skip_tls_verify))
+                    result = run_process(oc_command(args, 'whoami'), env, args.timeout)
+                    if result.returncode == 0 and result.stdout.strip() == username:
+                        atomic_yaml(cluster['kubeconfig'], logged_in)
+                        blocked_groups.discard(group)
+                if result.returncode:
+                    if result.returncode == 124:
+                        raise ValueError('identity preflight timed out')
+                    diagnostic = (result.stdout + result.stderr).lower()
+                    if any(text in diagnostic for text in ('x509', 'certificate', 'tls')):
+                        raise ValueError('TLS certificate verification failed')
+                    raise ValueError('identity preflight failed (network, authorization or oc error)')
+                if result.stdout.strip() != username:
+                    raise ValueError('identity differs from registered username')
+                ready.append((cluster, env))
+            except (ValueError, OSError) as error:
+                print(cluster['name'] + ': ' + str(error), file=sys.stderr)
+                failed = True
+        if failed and not args.continue_on_error:
+            return 1
+        if args.action == 'login':
+            return int(failed)
+        ordered = sorted(ready, key=lambda entry: entry[0]['name'])
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as pool:
+            try:
+                results = list(pool.map(lambda entry: run_target(args, *entry), ordered))
+            except BaseException:
+                CANCELLED.set()
+                with PROCESS_LOCK:
+                    for process in ACTIVE_PROCESSES:
+                        kill_group(process)
+                raise
+        for (cluster, env), result in zip(ordered, results):
+            status = 'OK' if result.returncode == 0 else 'ERROR'
+            if args.output == 'table':
+                print(f"{cluster['name']} | {status} | exit {result.returncode}")
+            else:
+                print(f"== {cluster['name']} ({status}, exit {result.returncode}) ==")
+            print(result.stdout, end='')
+            if result.stderr:
+                print('== ' + cluster['name'] + ' stderr ==', file=sys.stderr)
+                print(result.stderr, end='', file=sys.stderr)
+            failed |= result.returncode != 0
+    return int(failed)
+
+
+def run_target(args, cluster, env):
+    command = oc_command(args, 'logout') if args.action == 'logout' else args.command
+    try:
+        result = run_process(command, env, args.timeout)
+        if args.action == 'logout' and result.returncode == 0:
+            saved = session_config(cluster)
+            saved['users'][0]['user'] = {}
+            atomic_yaml(cluster['kubeconfig'], saved)
+            result.stdout = 'logged out\n'
+        return result
+    except (OSError, ValueError) as error:
+        return subprocess.CompletedProcess(command, 1, '', str(error) + '\n')
+
+
+def positive_workers(value):
+    value = int(value)
+    if value <= 0:
+        raise argparse.ArgumentTypeError('workers must be positive')
+    return value
+
+
+def positive_timeout(value):
+    value = float(value)
+    if not math.isfinite(value) or value <= 0:
+        raise argparse.ArgumentTypeError('timeout must be positive and finite')
+    return value
+
 
 def main():
-
-    parser = argparse.ArgumentParser()
-    sub = parser.add_subparsers(dest="cmd")
-
-    add = sub.add_parser("add")
-    add.add_argument("name")
-    add.add_argument("server")
-    add.add_argument("kubeconfig")
-    add.add_argument("--user", required=True)
-
-    sub.add_parser("list")
-
-    rm = sub.add_parser("remove")
-    rm.add_argument("name")
-
-    sub.add_parser("logout")
-
-    exe = sub.add_parser("exec")
-    exe.add_argument("--command", required=True)
-    exe.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
-    exe.add_argument("--output", choices=["raw", "table"], default="raw")
-
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+    signal.signal(signal.SIGTERM, signal.default_int_handler)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--config', type=Path, default=Path.home() / '.mcm.yaml')
+    sub = parser.add_subparsers(dest='action', required=True)
+    add = sub.add_parser('add')
+    for field in ('name', 'server', 'kubeconfig'):
+        add.add_argument(field)
+    add.add_argument('--user')
+    add.add_argument('--credential-group')
+    add.add_argument('--certificate-authority')
+    sub.add_parser('remove').add_argument('name')
+    sub.add_parser('list')
+    for action in ('exec', 'login', 'logout'):
+        command = sub.add_parser(action)
+        if action == 'exec':
+            command.add_argument('--command', required=True)
+        command.add_argument('--output', choices=('raw', 'table'), default='raw')
+        command.add_argument('--insecure-skip-tls-verify', action='store_true')
+        command.add_argument('--continue-on-error', action='store_true')
+        command.add_argument('--cluster', action='append')
+        command.add_argument('--timeout', type=positive_timeout, default=30)
+        command.add_argument('--workers', type=positive_workers, default=8)
     args = parser.parse_args()
-    manager = ClusterManager(CONFIG_PATH)
-
-    if args.cmd == "add":
-        manager.add(args.name, args.server, args.kubeconfig, args.user)
-
-    elif args.cmd == "list":
-        for c in manager.list():
-            print(f"{c.name:20} {c.server} ({c.username})")
-
-    elif args.cmd == "remove":
-        manager.remove(args.name)
-
-    elif args.cmd == "logout":
-        for c in manager.list():
-            LoginManager.logout(c)
-            print(f"{c.name}: logged out")
-
-    elif args.cmd == "exec":
-        executor = CommandExecutor(manager.list(), args.workers)
-        results = executor.run(args.command)
-
-        if args.output == "table":
-            print_table(results)
-        else:
-            for r in results:
-                print(f"\n== {r['cluster']} ==")
-                print(r["stdout"] or r["stderr"])
-
-    else:
-        parser.print_help()
+    try:
+        args.config = private_path(args.config, Path.cwd())
+        if args.action in ('add', 'remove'):
+            return edit_config(args)
+        data = load_config(args.config)
+        if args.action == 'list':
+            for cluster in sorted(data['clusters'], key=lambda c: c['name']):
+                print(f"{cluster['name']:20} {cluster['server']} ({data['credential_groups'][cluster['credential_group']]}; group={cluster['credential_group']})")
+            return 0
+        if args.cluster:
+            unknown = set(args.cluster) - {c['name'] for c in data['clusters']}
+            if unknown:
+                raise ValueError('unknown cluster selection: ' + ', '.join(sorted(unknown)))
+            data['clusters'] = [c for c in data['clusters'] if c['name'] in args.cluster]
+        if not data['clusters']:
+            raise ValueError('no clusters selected; register one with mcm add')
+        return execute(args, data)
+    except KeyboardInterrupt:
+        print('mcm: cancelled; child process groups stopped', file=sys.stderr)
+        return 130
+    except (ValueError, OSError, yaml.YAMLError) as error:
+        print('mcm: ' + str(error), file=sys.stderr)
+        return 1
 
 
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    sys.exit(main())

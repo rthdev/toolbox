@@ -71,9 +71,11 @@ CONTRIBUTING.md        Development and branch/PR workflow
 - Inspect scripts and test in a non-production environment before operational use.
 - Verify the target host, cluster, identity and namespace. Read-only cluster
   reporters use existing CLI credentials. [`mcm`](docs/mcm.md) can log in and
-  modify its configured kubeconfigs; shell commands run against **every registered
-  cluster**, without confirmation or dry-run. Its automatic login disables TLS
-  verification and passes the password as a process argument.
+  manage separate per-cluster sessions, validate server/identity, and prompt once
+  per explicit credential group when needed. TLS verification is on by default;
+  passwords stay in memory and private terminal input. Shell commands target
+  **all registrations unless selected with `--cluster`**, without confirmation or
+  dry-run. All targets must pass preflight unless `--continue-on-error` is explicit.
 - [`qrm`](docs/qrm.md) tag deletion requires interactive confirmation or `--yes`.
   Preview the exact target with its network-free `--dry-run` before deleting.
 - `kdf` executes `df` inside a container. `ocprems` reads cluster-scoped API request

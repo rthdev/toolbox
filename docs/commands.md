@@ -5,8 +5,8 @@
 The standard convention is **0** for success/help, **1** for operational failure,
 and **2** for invalid usage, with results on stdout and diagnostics on stderr.
 Check each command's guide for exceptions: `ogn` preserves external-command
-failure statuses, and `mcm` does not propagate per-cluster command failures to its
-exit status. The commands documented here support local `-h`/`--help` without
+failure statuses, and `mcm` returns 1 if any selected target fails (130 on
+cancellation). The commands documented here support local `-h`/`--help` without
 server or cluster access; Python imports still require installed runtime packages.
 
 Runtime baseline: Linux, Bash 4.4+, GNU coreutils/findutils and the command-specific
@@ -110,12 +110,15 @@ and output/exit-status contracts.
 ```
 
 Requires Python 3.9+ and PyYAML, plus `oc` and the shell commands used for cluster
-operations. Registrations live in `~/.mcm.yaml`. **`exec` runs on every registered
-cluster without confirmation or dry-run**, and automatic login disables TLS
-verification and exposes the password as a process argument. Per-cluster command
-failures do not make the overall exit status nonzero. Read the [mcm guide](mcm.md)
-for registration, target checks, login/logout effects and output limitations before
-running commands.
+operations on POSIX. Registrations default to `~/.mcm.yaml` (`--config FILE` overrides).
+`login` and `exec` automatically authenticate as needed, prompting once per explicit
+credential group through private terminal input. TLS verification is enabled by
+default, with custom CA support and a warned, invocation-only insecure override.
+**Without repeatable `--cluster NAME`, operations select every registration.** All
+selected targets must pass server/identity preflight before commands run, unless
+`--continue-on-error` is explicit; any target failure returns 1. Both output streams
+are retained, and subprocesses have configurable timeouts with process-group cleanup.
+Read the [mcm guide](mcm.md) for configuration migration and operational limits.
 
 ## `ogn`: node roles and topology
 
