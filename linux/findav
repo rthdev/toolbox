@@ -4,14 +4,19 @@
 set -o pipefail
 
 usage() {
-    printf 'Usage: %s [-r] [START_PATH]\n' "${0##*/}"
+    printf 'Usage: %s [-r|--recursive] [-0|--null] [--] [START_PATH]\n' "${0##*/}"
     printf '       %s [-h|--help]\n' "${0##*/}"
 }
 
 recursive=false
+null_output=false
 
 while (($# > 0)); do
     case $1 in
+        -0|--null)
+            null_output=true
+            shift
+            ;;
         -r|--recursive)
             recursive=true
             shift
@@ -48,17 +53,28 @@ if [[ ! -e $start_path ]]; then
     exit 1
 fi
 
-is_vault_file() {
+scan_file() {
     local file=$1 first_line=''
 
-    [[ -f $file && -r $file ]] || return 1
-    IFS= read -r first_line < "$file" || [[ -n $first_line ]]
-    [[ $first_line == '$ANSIBLE_VAULT;'* ]]
+    # Unlike Bash read, head distinguishes clean EOF from a read failure.
+    # Redirect input so a literal '-' filename never means standard input.
+    if [[ ! -f $file || ! -r $file ]] || ! first_line=$(head -n 1 < "$file"); then
+        printf 'Error: cannot read file; scan incomplete: %s\n' "$file" >&2
+        return 1
+    fi
+    if [[ $first_line == \$ANSIBLE_VAULT\;* ]]; then
+        if [[ $null_output == true ]]; then
+            printf '%s\0' "$file"
+        else
+            printf '%s\n' "$file"
+        fi
+    fi
+    return 0
 }
 
 if [[ -f $start_path ]]; then
-    is_vault_file "$start_path" && printf '%s\n' "$start_path"
-    exit 0
+    scan_file "$start_path"
+    exit $?
 fi
 
 if [[ ! -d $start_path ]]; then
@@ -66,14 +82,24 @@ if [[ ! -d $start_path ]]; then
     exit 1
 fi
 
+# find can treat these starting paths as expressions, even after its --.
+if [[ $start_path == -* || $start_path == '!' || $start_path == '(' ]]; then
+    start_path=./$start_path
+fi
 find_args=("$start_path")
 if [[ $recursive == false ]]; then
     find_args+=(-maxdepth 1)
 fi
 find_args+=(-type f -print0)
 
-while IFS= read -r -d '' file; do
-    if is_vault_file "$file"; then
-        printf '%s\n' "$file"
-    fi
-done < <(find "${find_args[@]}")
+# A pipeline with pipefail preserves find's traversal status.
+if ! find "${find_args[@]}" | (
+    scan_status=0
+    while IFS= read -r -d '' file; do
+        scan_file "$file" || scan_status=1
+    done
+    exit "$scan_status"
+); then
+    printf 'Error: scan incomplete.\n' >&2
+    exit 1
+fi
