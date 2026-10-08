@@ -263,12 +263,16 @@ resize status/allocated-resource reconciliation is not implemented: during a
 resize, these spec-based values may differ from the scheduler's current accounting.
 
 Usage is read from structured `metrics.k8s.io/v1beta1` snapshots, keyed by actual
-namespace and pod name. Missing CPU/memory, absent pod/node samples, and missing
-application or restartable-sidecar container samples display **`unknown`**, never
-zero. Any unknown constituent makes that usage total unknown. Available extra
-container samples are included in pod usage. Metrics endpoint failures (including
-RBAC denial, timeout or invalid list JSON) emit a warning but still produce a
-successful resource report with unknown usage. Invalid resource quantities or
+namespace and pod name. In pod reports (`nstop` and `ptop`), Succeeded/Failed pods
+have known zero current CPU/memory usage, even if stale metrics remain; their
+spec-based requests/limits are unchanged. For nonterminal pods and node samples,
+missing CPU/memory, absent samples, and missing application or restartable-sidecar
+container samples display **`unknown`**, never zero. Any unknown constituent makes
+that usage total unknown; terminal pods contribute zero, so an all-terminal
+`nstop` report has zero usage totals. Available extra container samples are included
+in nonterminal pod usage. Metrics endpoint failures (including RBAC denial, timeout
+or invalid list JSON) emit a warning but still produce a successful resource report
+with unknown usage except for terminal pods. Invalid resource quantities or
 malformed resource records fail rather than fabricate capacity.
 
 **N-1 is arithmetic, not a scheduling or failover guarantee.** It does not model

@@ -252,6 +252,53 @@ print(value if isinstance(value, str) else json.dumps(value))
                         self.assertIn("expected a JSON object", result.stderr)
                         self.assertNotIn("Traceback", result.stderr)
 
+    def test_terminal_pod_usage_is_zero_in_rows_and_totals(self):
+        for phase in ("Succeeded", "Failed"):
+            for stale_metrics in (False, True):
+                for active_phase in (None, "measured", "Running", "Pending", "Unknown"):
+                    with self.subTest(
+                        phase=phase, stale_metrics=stale_metrics, active_phase=active_phase
+                    ):
+                        terminal = pod("completed")
+                        terminal["status"]["phase"] = phase
+                        self.data["pods"]["items"] = [terminal]
+                        self.data["pod_metrics"]["items"] = []
+                        if stale_metrics:
+                            self.data["pod_metrics"]["items"].append({
+                                "metadata": terminal["metadata"],
+                                "containers": [{
+                                    "name": "app", "usage": {"cpu": "9", "memory": "9Gi"}
+                                }],
+                            })
+                        if active_phase is not None:
+                            active = pod()
+                            if active_phase != "measured":
+                                active["status"]["phase"] = active_phase
+                            self.data["pods"]["items"].append(active)
+                            if active_phase == "measured":
+                                self.data["pod_metrics"]["items"].append({
+                                    "metadata": active["metadata"],
+                                    "containers": [{
+                                        "name": "app", "usage": {"cpu": "250m", "memory": "2Mi"}
+                                    }],
+                                })
+                        result = self.run_tool("nstop", "-n", "team")
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        rows = {row[0]: row for row in table_rows(result.stdout)[1:]}
+                        self.assertEqual(rows["completed"][-2:], ["0.00", "0.00"])
+                        # Terminal usage must not change declared spec requests/limits.
+                        self.assertEqual(
+                            rows["completed"][2:6], ["0.50", "1.00", "2.00", "953.67"]
+                        )
+                        expected = ["0.00", "0.00"] if active_phase is None else (
+                            ["0.25", "2.00"] if active_phase == "measured"
+                            else ["unknown", "unknown"]
+                        )
+                        self.assertEqual(rows["TOTAL"][-2:], expected)
+                        if active_phase is not None:
+                            self.assertEqual(rows["app"][-2:], expected)
+                        self.assertEqual(len(self.calls), 2)
+
     def test_missing_metrics_remain_unknown_in_rows_and_totals(self):
         self.data["pods"]["items"].append(pod("unmeasured"))
         for metrics in (

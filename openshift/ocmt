@@ -148,7 +148,10 @@ def pod_resources(pod):
 
 
 def pod_usage(pod, metric):
-    """Unknown if any expected long-running container lacks a metric."""
+    """Terminal pods use zero; otherwise missing expected metrics mean unknown."""
+    if pod.get("status", {}).get("phase") in ("Succeeded", "Failed"):
+        # A metrics snapshot may still contain samples from before termination.
+        return {"CPU_USAGE": 0.0, "MEM_USAGE": 0.0}
     containers = metric.get("containers") or []
     measured = {container["name"] for container in containers}
     expected = {container["name"] for container in pod["spec"]["containers"]}
