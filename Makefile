@@ -1,6 +1,6 @@
 PYTHON ?= python3
 SHELL := /bin/bash
-SHELL_FILES := linux/ced linux/certinfo linux/lsswap linux/pls openshift/kdf openshift/ocprems openshift/ogn
+SHELL_FILES := linux/ced linux/certinfo linux/findav linux/lsswap linux/pls openshift/kdf openshift/ocprems openshift/ogn
 
 .PHONY: check syntax lint test
 check: syntax lint test
