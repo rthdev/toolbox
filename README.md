@@ -2,6 +2,7 @@
 
 Small command-line helpers for Linux administration, troubleshooting and OpenShift.
 Commands intentionally have no `.sh` or `.py` extension.
+Copyable teaching templates live separately in `templates/`.
 
 ## Commands
 
@@ -22,6 +23,13 @@ Commands intentionally have no `.sh` or `.py` extension.
 
 See the [command guide](docs/commands.md) for options, examples, dependencies,
 permissions, exit codes and limitations.
+
+## Demo template
+
+[`templates/demo-template.sh`](templates/demo-template.sh) is a self-contained Bash
+workflow demonstration template. Copy it, edit its header and `demo()` sequence,
+then press Enter to execute each displayed command. Failures do not stop the demo.
+See the [editing guide](docs/demo-template.md) for pipelines, redirection and quoting.
 
 ## Getting started
 
@@ -49,6 +57,7 @@ the commands you use; there is no repository-wide runtime package installation.
 ```text
 linux/                 Linux and certificate commands
 openshift/             Cluster commands
+templates/             Copyable workflow demonstration templates
 docs/commands.md       Command reference and operational limits
 tests/                 Offline regression tests and loopback TLS integration
 .github/workflows/     Pull-request validation
