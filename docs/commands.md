@@ -181,3 +181,131 @@ Missing values display `unknown` or `(no caller data)`; no removal entries is an
 explicit successful empty result. Tabs, newlines and backslashes within caller
 fields are TSV-escaped. Output may contain usernames and client identifiers; treat
 it as operational information when sharing. No cluster resources are changed.
+
+## `ocmt`: OpenShift Capacity Management Tool
+
+```bash
+./openshift/ocmt                              # capacity (the default)
+./openshift/ocmt capacity --node-role worker
+./openshift/ocmt nstop                        # current-context namespace
+./openshift/ocmt nstop -n application --sort-by MEM_USAGE
+./openshift/ocmt ptop --limit 30 --sort-by CPU_REQUEST
+./openshift/ocmt ptop -n application --label 'topology.kubernetes.io/zone=east'
+./openshift/ocmt free --node-role worker --timeout 15
+```
+
+Standalone successor to `ocptool`, retaining its four report modes and option
+names. Requires Python 3.9+ and a configured, logged-in `oc`; no `tabulate`, jq,
+or other Python package is required. It never changes contexts or cluster resources.
+
+### Modes and options
+
+- **`capacity`** (default): allocatable, effective requests, declared limits and
+  metrics usage per node, with totals grouped by node role. Includes all matching
+  nodes, displaying Ready/NotReady and cordoned state. Role priority is control
+  (`control-plane` or `master`), infra, then worker; unlabelled nodes retain the
+  worker fallback.
+- **`nstop`**: all pods in `-n/--namespace` or the current kubeconfig namespace
+  (defaults to `default` if unset). Includes unassigned and completed pods, and a
+  total for all matching rows. Unassigned nodes display `N/A`.
+- **`ptop`**: top 20 assigned pods across all namespaces, or just `-n/--namespace`
+  when supplied. `--limit N` selects a positive number of rows. Unassigned pods are
+  excluded, as in the original; use `nstop` to inspect them. No total is shown for
+  this truncated ranking.
+- **`free`**: per-role N-1 aggregate headroom. From the total allocatable of Ready,
+  uncordoned matching nodes, subtract the largest node allocation independently
+  for CPU and memory, then subtract all assigned nonterminal pod requests on
+  matching nodes, including NotReady/cordoned nodes. Reports the worst CPU/memory
+  node names (which can differ). A single available node leaves zero effective
+  N-1 capacity; negative free values are retained. No available nodes shows `none`
+  for the worst-node names.
+
+`--node-role {control,infra,worker}` and `--label SELECTOR` apply to nodes in every
+mode; pod reports then include only pods assigned to those nodes. `--label` is
+now effective, passed as a single node-selector argument to `oc`; Kubernetes
+validates selector syntax. It is **not** a pod-label selector. Combining the
+options intersects their filters.
+
+`--sort-by COLUMN` works in pod reports: `POD`, `NODE`, `CPU_REQUEST`, `MEM_REQUEST`,
+`CPU_LIMIT`, `MEM_LIMIT`, `CPU_USAGE`, `MEM_USAGE`, and additionally `NAMESPACE` for
+`ptop`. Sorts descending (including text), defaulting to `CPU_REQUEST`; missing
+values sort last, and namespace/pod name break ties deterministically.
+
+`--timeout SECONDS` is an integer from 1 to 3600, default 30. Each `oc` invocation
+has both a server request timeout and a subprocess wall-clock timeout. The latter
+bounds the entire invocation, including discovery/pagination. There are no retries.
+Namespace must be a valid lowercase DNS label. Options irrelevant to a mode are
+rejected instead of silently ignored: namespace/sort are pod-report options and
+limit is ptop-only. Help does not require `oc` or cluster access.
+
+### Accounting and interpretation
+
+CPU is reported in cores, memory in MiB, both to two decimal places. Kubernetes
+binary, decimal, milli/micro/nano and exponent quantities are resource-aware:
+`1048576` bytes is 1 MiB, `1G` is about 953.67 MiB, and `250m` CPU is 0.25 cores.
+Memory `m` means millibytes, not MiB. Totals use unrounded values, so displayed
+rounded rows need not sum exactly to displayed totals.
+
+Requests/limits come from **pod specifications**, not human-readable `describe`
+output. Application container sums are compared with ordered init-container
+peaks; restartable init sidecars accumulate during subsequent initialization and
+continue alongside application containers. Pod-level resource budgets, where
+present, override that resource's container aggregate. Pod overhead is added to
+requests and to nonzero limits. Ephemeral containers do not add reservations.
+Missing requests/limits contribute zero. **Declared limit totals are not workload
+ceilings**: an unspecified limit means unbounded, not a zero cap, and partially
+limited workloads can exceed the displayed sum.
+
+Node accounting excludes unassigned and Succeeded/Failed pods, but includes
+assigned Pending pods and nonterminal terminating pods. Pod reports retain all
+phases in their scope, so their totals can differ from node reservations. In-place
+resize status/allocated-resource reconciliation is not implemented: during a
+resize, these spec-based values may differ from the scheduler's current accounting.
+
+Usage is read from structured `metrics.k8s.io/v1beta1` snapshots, keyed by actual
+namespace and pod name. In pod reports (`nstop` and `ptop`), Succeeded/Failed pods
+have known zero current CPU/memory usage, even if stale metrics remain; their
+spec-based requests/limits are unchanged. For nonterminal pods and node samples,
+missing CPU/memory, absent samples, and missing application or restartable-sidecar
+container samples display **`unknown`**, never zero. Any unknown constituent makes
+that usage total unknown; terminal pods contribute zero, so an all-terminal
+`nstop` report has zero usage totals. Available extra container samples are included
+in nonterminal pod usage. Metrics endpoint failures (including RBAC denial, timeout
+or invalid list JSON) emit a warning but still produce a successful resource report
+with unknown usage except for terminal pods. Invalid resource quantities or
+malformed resource records fail rather than fabricate capacity.
+
+**N-1 is arithmetic, not a scheduling or failover guarantee.** It does not model
+resource fragmentation, taints/tolerations, affinity/topology, pod-count limits,
+volumes, extended resources, quotas, pending demand or disruption budgets. Even
+Ready uncordoned nodes may be ineligible for a workload. `capacity` totals are an
+inventory, including unavailable nodes; only `free` excludes those allocations.
+Snapshots and metrics windows are not atomic and may disagree during changes.
+
+Capacity values at or above 60% of allocatable are red only on a suitable TTY.
+Redirected output, `TERM=dumb`, an unset/empty `TERM`, or any set `NO_COLOR` disables
+color. Tables are plain aligned Markdown with no terminal-library dependency.
+
+### Collection, permissions and failures
+
+`capacity` uses three bulk `oc` calls (nodes, all pods, node metrics); `free` uses
+two (nodes, all pods). Pod reports use two (pods and pod metrics), plus one node
+list if filtering by node, and one local kubeconfig lookup for implicit `nstop`
+namespace. Command count is independent of pod/node count; `oc` may make additional
+API discovery or pagination requests internally. JSON travels through stdout,
+never through command-line payload arguments. Snapshots are held in memory.
+
+Grant list access to nodes and cluster-wide pods for node reports; pod reports
+need pod list access only in their scope, plus node list access when filtering by
+node. Usage additionally needs list access to `nodes.metrics.k8s.io` or
+`pods.metrics.k8s.io` in the relevant scope. No exec, writes or cluster-admin grant
+is required. Core-data failures return **1**, invalid CLI usage **2**, and successful
+reports/help **0** (including degraded metrics with warnings). Core collection and
+calculation complete before report output; diagnostics go to stderr.
+
+Compared with `ocptool`, intentional changes are corrected resource accounting,
+namespace-aware metrics, effective label filtering, explicit missing usage,
+bounded/error-checked collection, mode-specific argument validation, TTY-safe
+color, and conservative N-1 wording/available-node handling. `ptop -n` now scopes
+the report rather than ignoring the namespace. These are reports, not a stable
+machine-readable output API. The original executable is unchanged.

@@ -7,10 +7,11 @@ check: syntax lint test
 
 syntax:
 	@for file in $(SHELL_FILES); do bash -n "$$file" || exit; done
+	$(PYTHON) -c 'import ast; from pathlib import Path; ast.parse(Path("openshift/ocmt").read_text(), filename="openshift/ocmt")'
 
 lint:
 	shellcheck $(SHELL_FILES)
-	ruff check tests
+	ruff check tests openshift/ocmt
 
 # Network access is limited to a loopback TLS fixture; no real cluster is contacted.
 test:
