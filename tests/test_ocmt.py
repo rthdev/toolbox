@@ -475,6 +475,63 @@ print(value if isinstance(value, str) else json.dumps(value))
         self.assertFalse(any("describe" in call or "top" in call for call in self.calls))
         self.assertTrue(any("pods" in call and "-A" in call for call in self.calls))
 
+    def test_free_uses_one_table_with_shared_widths_across_roles(self):
+        control = "control-with-a-long-cpu-node-name"
+        infra = "infra-with-an-even-longer-memory-node-name"
+        self.data["nodes"]["items"] = [
+            node("worker-a"),
+            node(infra, "1234567890123", "123456789012345Mi",
+                 labels={"node-role.kubernetes.io/infra": "", "zone": "east"}),
+            node(control, "8", "16Gi",
+                 labels={"node-role.kubernetes.io/control-plane": "", "zone": "east"}),
+        ]
+        headers = [
+            "ROLE", "CPU_ALLOC", "CPU_REQUEST", "CPU_EFF(N-1)", "CPU_FREE",
+            "MEM_ALLOC(Mi)", "MEM_REQUEST(Mi)", "MEM_EFF(N-1)(Mi)", "MEM_FREE(Mi)",
+            "WORST_CPU_NODE", "WORST_MEM_NODE",
+        ]
+        expected = [
+            ["control", "8.00", "0.00", "0.00", "0.00", "16384.00", "0.00",
+             "0.00", "0.00", control, control],
+            ["infra", "1234567890123.00", "0.00", "0.00", "0.00",
+             "123456789012345.00", "0.00", "0.00", "0.00", infra, infra],
+            ["worker", "4.00", "0.50", "0.00", "-0.50", "8192.00", "1.00",
+             "0.00", "-1.00", "worker-a", "worker-a"],
+        ]
+        for arguments, selected in (
+            ((), expected),
+            (("--label", "zone=east"), expected[:2]),
+            (("--node-role", "worker"), expected[2:]),
+            (("--label", "zone=east", "--node-role", "worker"), []),
+        ):
+            with self.subTest(arguments=arguments):
+                result = self.run_tool("free", *arguments)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stderr, "")
+                self.assertEqual(len(self.calls), 2)
+                if not selected:
+                    self.assertEqual(result.stdout, "No matching nodes found.\n")
+                    continue
+                self.assertEqual(result.stdout.count("| ROLE"), 1)
+                self.assertEqual(table_rows(result.stdout), [headers] + selected)
+                lines = [line for line in result.stdout.splitlines() if line.startswith("|")]
+                self.assertEqual(len(lines), len(selected) + 2)
+                boundaries = [index for index, char in enumerate(lines[0]) if char == "|"]
+                for line in lines[1:]:
+                    self.assertEqual(
+                        [index for index, char in enumerate(line) if char == "|"], boundaries
+                    )
+                self.assert_table_alignment(result.stdout)
+                self.assertIn("N-1 aggregate headroom: not a scheduling guarantee.\n", result.stdout)
+                self.assertIn(
+                    "Allocatable includes only Ready, uncordoned nodes; "
+                    "requests include all matching nodes.\n", result.stdout
+                )
+        self.data["nodes"]["items"] = []
+        result = self.run_tool("free")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "No matching nodes found.\n")
+
     def test_free_reports_conservative_n_minus_one_arithmetic_not_guarantee(self):
         self.data["nodes"]["items"].extend(
             [

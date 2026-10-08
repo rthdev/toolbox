@@ -353,6 +353,7 @@ def report_free(args, cluster):
         return
     print("N-1 aggregate headroom: not a scheduling guarantee.")
     print("Allocatable includes only Ready, uncordoned nodes; requests include all matching nodes.")
+    results = []
     for role in ("control", "infra", "worker"):
         group = sorted(
             (row for row in rows.values() if row["ROLE"] == role), key=lambda row: row["NODE"]
@@ -370,22 +371,23 @@ def report_free(args, cluster):
             result[prefix + "_EFF(N-1)"] = effective
             result[prefix + "_FREE"] = effective - result[prefix + "_REQUEST"]
             result["WORST_" + prefix + "_NODE"] = worst["NODE"] if worst else "none"
-        print_table(
-            [
-                "ROLE",
-                "CPU_ALLOC",
-                "CPU_REQUEST",
-                "CPU_EFF(N-1)",
-                "CPU_FREE",
-                "MEM_ALLOC",
-                "MEM_REQUEST",
-                "MEM_EFF(N-1)",
-                "MEM_FREE",
-                "WORST_CPU_NODE",
-                "WORST_MEM_NODE",
-            ],
-            [result],
-        )
+        results.append(result)
+    print_table(
+        [
+            "ROLE",
+            "CPU_ALLOC",
+            "CPU_REQUEST",
+            "CPU_EFF(N-1)",
+            "CPU_FREE",
+            "MEM_ALLOC",
+            "MEM_REQUEST",
+            "MEM_EFF(N-1)",
+            "MEM_FREE",
+            "WORST_CPU_NODE",
+            "WORST_MEM_NODE",
+        ],
+        results,
+    )
 
 
 def parse_args():
