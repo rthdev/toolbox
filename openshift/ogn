@@ -4,42 +4,81 @@
 # Lists nodes in order: Master, Infra, Worker
 # Displays region and zone information
 
-oc get nodes -o json | jq -r '
-  .items
+usage() {
+    printf 'Usage: ogn [-h|--help]\nList node capacity by role, region, zone, and name.\n'
+}
+
+if (( $# == 1 )) && [[ $1 == -h || $1 == --help ]]; then
+    usage
+    exit 0
+elif (( $# != 0 )); then
+    printf 'ogn: unexpected arguments\n' >&2
+    usage >&2
+    exit 2
+fi
+
+for dependency in oc jq awk; do
+    if ! command -v "$dependency" >/dev/null 2>&1; then
+        printf 'ogn: required command not found: %s\n' "$dependency" >&2
+        exit 127
+    fi
+done
+
+nodes=$(oc get nodes -o json) || exit "$?"
+# Buffer collection and parsing separately: failures must not emit a table.
+# Slurp verifies exactly one JSON document, including the empty-input case.
+rows=$(jq -rs '
+  def field:
+    if type != "string" then error("expected a string report field")
+    elif test("[|\\x00-\\x1f\\x7f]") then error("invalid report field characters")
+    else . end;
+  def optional_field: if . == null then "N/A" else field end;
+  if length != 1 then error("expected one node list") else .[0] end
+  | .items
+  | if type != "array" then error("expected a node items array") else . end
   | map(
-      {
+      if (.metadata.name | type) != "string" then error("invalid node name") else . end
+      | (.metadata.labels | has("node-role.kubernetes.io/master")
+          or has("node-role.kubernetes.io/control-plane")) as $master
+      | .metadata.labels["node-role.kubernetes.io/infra"] as $infra
+      | {
         name: .metadata.name,
-        roles: (
-          [
-            (if .metadata.labels["node-role.kubernetes.io/master"] then "master" else empty end),
-            (if .metadata.labels["node-role.kubernetes.io/infra"] then "infra" else empty end),
-            (if .metadata.labels["node-role.kubernetes.io/worker"] then "worker" else empty end)
-          ] | join(",")
-        ),
-        cpu: (.status.capacity.cpu // "N/A"),
-        memory: (.status.capacity.memory // "N/A"),
-        region: (.metadata.labels["topology.kubernetes.io/region"] // "N/A"),
-        zone: (.metadata.labels["topology.kubernetes.io/zone"] // "N/A"),
-        masterRole: (if .metadata.labels["node-role.kubernetes.io/master"] then 0 else 999 end),
-        infraRole: (if .metadata.labels["node-role.kubernetes.io/infra"] then 1 else 999 end),
-        workerRole: (if .metadata.labels["node-role.kubernetes.io/worker"] then 2 else 999 end)
+        roles: ([
+          (if $master then "master" else empty end),
+          (if $infra then "infra" else empty end),
+          (if .metadata.labels["node-role.kubernetes.io/worker"] then "worker" else empty end)
+        ] | join(",")),
+        cpu: (.status.capacity.cpu | optional_field),
+        memory: (.status.capacity.memory | optional_field),
+        region: (.metadata.labels["topology.kubernetes.io/region"] | optional_field),
+        zone: (.metadata.labels["topology.kubernetes.io/zone"] | optional_field),
+        sortPriority: (if $master then 0 elif $infra then 1 else 2 end)
       }
     )
-  | map(
-      .sortPriority = (
-        if .masterRole == 0 then 0
-        elif .infraRole == 1 then 1
-        else 2
-        end
-      )
-    )
-  | sort_by(.sortPriority, .region, .zone)
-  | .[] | "\(.name)|\(.roles)|\(.cpu)|\(.memory)|\(.region)|\(.zone)"
-' | awk -F'|' '
+  | sort_by(.sortPriority, .region, .zone, .name)
+  | .[] | [.name, .roles, .cpu, .memory, .region, .zone] | map(field) | join("|")
+' <<< "$nodes") || exit "$?"
+{ if [[ -n $rows ]]; then printf '%s\n' "$rows"; fi; } | awk -F'|' '
   BEGIN {
-    printf "%-30s %-20s %-8s %-15s %-20s %s\n", "NAME", "ROLES", "CPU", "MEMORY", "REGION", "ZONE"
+    split("NAME ROLES CPU MEMORY REGION ZONE", headers, " ")
+    for (column = 1; column <= 6; column++) {
+      cells[0, column] = headers[column]
+      widths[column] = length(headers[column])
+    }
   }
   {
-    printf "%-30s %-20s %-8s %-15s %-20s %s\n", $1, $2, $3, $4, $5, $6
+    for (column = 1; column <= 6; column++) {
+      cells[NR, column] = $column
+      if (length($column) > widths[column]) widths[column] = length($column)
+    }
+  }
+  END {
+    for (row = 0; row <= NR; row++) {
+      for (column = 1; column <= 6; column++) {
+        format = (column == 3 || column == 4) ? "%*s" : "%-*s"
+        printf format, widths[column], cells[row, column]
+        printf "%s", (column == 6 ? "\n" : "  ")
+      }
+    }
   }
 '
