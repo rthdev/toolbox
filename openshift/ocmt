@@ -209,7 +209,7 @@ def print_table(columns, rows, highlight=False):
                     and row[column] / allocatable >= WARNING_THRESHOLD
                 ):
                     value = WARNING_COLOR + value + RESET_COLOR
-            fields.append(value + padding)
+            fields.append(padding + value if column.startswith(("CPU_", "MEM_")) else value + padding)
         print("| " + " | ".join(fields) + " |")
         if index == 0:
             print("| " + " | ".join("-" * width for width in widths) + " |")

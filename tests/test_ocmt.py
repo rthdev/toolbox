@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -135,6 +136,59 @@ print(value if isinstance(value, str) else json.dumps(value))
         )
         self.calls = [json.loads(line) for line in self.log.read_text().splitlines()]
         return result
+
+    def assert_table_alignment(self, output):
+        """Check visible padding, including headers, totals and unknown cells."""
+        lines = re.sub(r"\x1b\[[0-9;]*m", "", output).splitlines()
+        text_columns = {"NAMESPACE", "POD", "NODE", "STATE", "ROLE",
+                        "WORST_CPU_NODE", "WORST_MEM_NODE"}
+        tables = 0
+        headers = []
+        widths = []
+        for index, line in enumerate(lines):
+            if not line.startswith("| "):
+                continue
+            fields = line[2:-2].split(" | ")
+            if fields[0].strip() in {"NAMESPACE", "POD", "NODE", "ROLE"}:
+                headers = [field.strip() for field in fields]
+                widths = [len(field) for field in fields]
+                self.assertEqual(
+                    lines[index + 1],
+                    "| " + " | ".join("-" * width for width in widths) + " |",
+                )
+                tables += 1
+                is_header = True
+            elif all(set(field) == {"-"} for field in fields):
+                continue
+            else:
+                is_header = False
+            self.assertEqual(len(fields), len(headers))
+            for header, field, width in zip(headers, fields, widths):
+                value = field.strip()
+                if header in text_columns:
+                    self.assertEqual(field, value.ljust(width), header)
+                else:
+                    self.assertEqual(field, value.rjust(width), header)
+                    if not is_header and value != "unknown":
+                        self.assertRegex(value, r"^-?\d+\.\d{2}$")
+        self.assertGreater(tables, 0)
+
+    def test_all_reports_right_align_numeric_columns_and_left_align_text(self):
+        long_node = "worker-with-a-long-name"
+        self.data["nodes"]["items"].append(
+            node(long_node, "1234567890123", "123456789012345Mi")
+        )
+        large = pod("pod-with-a-long-name", node=long_node)
+        large["spec"]["containers"] = [
+            container(cpu="1234567890123", memory="123456789012345Mi")
+        ]
+        self.data["pods"]["items"].append(large)
+        for action in ("capacity", "nstop", "ptop", "free"):
+            with self.subTest(action=action):
+                result = self.run_tool(action)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn("\x1b", result.stdout)
+                self.assert_table_alignment(result.stdout)
 
     def test_nstop_current_namespace_quantities_and_totals(self):
         result = self.run_tool("nstop")
@@ -621,6 +675,7 @@ print(value if isinstance(value, str) else json.dumps(value))
                 os.close(master)
                 os.close(slave)
             self.assertEqual("\x1b[91m3.00\x1b[0m" in output, expected)
+            self.assert_table_alignment(output)
         result = self.run_tool()
         self.assertNotIn("\x1b", result.stdout)
 
