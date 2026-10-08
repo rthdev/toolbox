@@ -1,139 +1,230 @@
 #!/usr/bin/python3
-# qrm - quay repo management
+"""qrm - Quay repository management."""
 
-import os
-import sys
-import getopt
 import argparse
-import requests
-from requests.auth import HTTPBasicAuth
 import json
-import getopt
-import socket
-import getpass
+import os
+from pathlib import Path
+import re
+import sys
+from urllib.parse import quote
 
-my_headers = {
- 'Content-type': 'application/json'
- }
+import requests
+
+REQUEST_TIMEOUT = (5, 30)
+MAX_PAGES = 1000
+my_headers = {"Content-type": "application/json"}
+
+
+def request(method, url, **kwargs):
+    try:
+        response = method(
+            url,
+            headers=my_headers.copy(),
+            # An explicit no-op auth handler prevents implicit .netrc credentials.
+            auth=lambda prepared: prepared,
+            timeout=REQUEST_TIMEOUT,
+            allow_redirects=False,
+            **kwargs,
+        )
+    except requests.RequestException:
+        raise ValueError("Registry request failed (connection, TLS, or timeout)") from None
+    if not 200 <= response.status_code < 300:
+        raise ValueError("HTTP " + str(response.status_code))
+    return response
+
+
+def responseJSON(response):
+    try:
+        return response.json()
+    except ValueError:
+        raise ValueError("Invalid JSON response") from None
 
 
 def getRepos(registry: str, public: bool):
-  next_page = ""
-  repositories = []
+    next_page = ""
+    repositories = []
+    seen = set()
+    for _ in range(MAX_PAGES):
+        response = responseJSON(
+            request(
+                requests.get,
+                "https://" + registry + "/api/v1/repository",
+                params={
+                    "public": str(public).lower(),
+                    "last_modified": "true",
+                    "next_page": next_page,
+                },
+            )
+        )
+        if not isinstance(response, dict) or not isinstance(response.get("repositories"), list):
+            raise ValueError("Invalid repository response")
+        for repo in response["repositories"]:
+            if not isinstance(repo, dict) or any(
+                not isinstance(repo.get(key), str)
+                or repo[key] in ("", ".", "..")
+                or "/" in repo[key]
+                or any(ord(c) < 33 or ord(c) == 127 for c in repo[key])
+                for key in ("namespace", "name")
+            ):
+                raise ValueError("Invalid repository entry")
+        next_page = response.get("next_page")
+        if next_page is not None and not isinstance(next_page, str):
+            raise ValueError("Invalid pagination cursor")
+        repositories.extend(response["repositories"])
+        if next_page is None or next_page == "":
+            return repositories
+        if next_page in seen:
+            raise ValueError("Repeated pagination cursor")
+        seen.add(next_page)
+    raise ValueError("Exceeded pagination page limit")
 
-  while True:
-     response = requests.get(
-       'https://' + str(registry) + '/api/v1/repository?public=' + str(public) + '&last_modified=true&next_page=' + str(next_page),
-        headers=my_headers
-     ).json()
-     repositories.append(response['repositories'])
 
-     if "next_page" in response:
-       next_page = response['next_page']
-     else:
-       break
+def repositoryURL(registry, repository):
+    path = "/".join(quote(part, safe="") for part in repository.split("/"))
+    return "https://" + registry + "/api/v1/repository/" + path
 
-  return repositories[0]
 
 def getRepoTags(registry, repository):
-  response = requests.get(
-    'https://' + str(registry) + '/api/v1/repository/' + str(repository) +'?includeTags=true',
-    headers=my_headers
-  ).json()
+    response = responseJSON(
+        request(requests.get, repositoryURL(registry, repository), params={"includeTags": "true"})
+    )
+    if not isinstance(response, dict) or not isinstance(response.get("tags"), dict):
+        raise ValueError("Invalid tags response")
+    if any(not isinstance(value, dict) for value in response["tags"].values()):
+        raise ValueError("Invalid tag entry")
+    return response["tags"]
 
-  return response['tags']
 
 def listAllRepoTags(registry):
-  response = []
+    rows = []
+    for repo in getRepos(registry, True):
+        repository = repo["namespace"] + "/" + repo["name"]
+        tags = getRepoTags(registry, repository)
+        rows.append({"repository": repository, "tags": ",".join(str(tag) for tag in tags)})
+    return rows
 
-  for repo in getRepos(registry, True):
-    alltags=""
 
-    tags = getRepoTags(registry, repo['namespace'] + '/' + repo['name'])
-
-    for tag in tags:
-      alltags += str(tag) + ','
-
-    alltags = alltags.strip(',')
-    my_dict = {'repository': repo['namespace'] + '/' + repo['name'], 'tags': alltags }
-    dict_copy = my_dict.copy()
-    response.append(dict_copy)
-
-  return response
+def tagURL(registry, repository, tag):
+    return repositoryURL(registry, repository) + "/tag/" + quote(tag, safe="")
 
 
 def deleteTag(registry, repository, tag):
-  response = requests.delete(
-    'https://' + str(registry) + '/api/v1/repository/' + str(repository) +'/tag' + tag,
-    headers=my_headers
-  ).json()
+    response = request(requests.delete, tagURL(registry, repository, tag))
+    if not response.content:
+        return None
+    return responseJSON(response)
 
-  return response
 
 def printAllTags(registry):
-   alldata = listAllRepoTags(registry)
-   print ('{:<60} {:<60}'.format("Repository", "Tags"))
-   print ('{:<120}'.format("=" * 120))
-   for repo in alldata:
-     print ('{:<60} {:<60}'.format(repo['repository'], repo['tags']))
+    rows = listAllRepoTags(registry)
+    print("{:<60} {:<60}".format("Repository", "Tags"))
+    print("=" * 120)
+    for repo in rows:
+        print("{:<60} {:<60}".format(repo["repository"], repo["tags"]))
 
 
-def checkRegistry(registry):
-  print ("Checking Registry: {:<}...".format(registry), end=" ")
-  try:
-    socket.create_connection((registry, '443'), timeout=10)
-    print ("[System: UP]...".format(registry), end=" ")
-    try:
-      response = requests.get(
-        'https://' + str(registry) + '/api/v1/discovery',
-        headers=my_headers
-      )
-      if response.status_code == 200:
-        print ("[Quay: UP]".format(registry))
-      else:
-        print ("[Quay: DOWN]".format(registry))
-        sys.exit("ERROR: Quay down or no quay on remote end")
-    except Exception as err:
-      sys.exit(err.__str__())
-
+def checkRegistry(registry, silent=False):
+    if not silent:
+        print("Checking Registry: " + registry + "...", file=sys.stderr)
+    request(requests.get, "https://" + registry + "/api/v1/discovery")
+    if not silent:
+        print("[Quay: UP]", file=sys.stderr)
     return True
-  except socket.timeout:
-    print ("[Systen: DOWN]".format(registry))
-    return False
-  except Exception as err:
-    sys.exit(err.__str__())
+
 
 def main(argv):
-  parser = argparse.ArgumentParser(description='Quay repository management script.', add_help=True)
-  parser.add_argument('-r', '--registry', required=True, dest='registry', help='Set the registry to connect to')
-  parser.add_argument('-p', '--repo', dest='repository', help='Set the repository to work on')
-  parser.add_argument('-t', '--tag', dest='tag', help='Set the tag to work on')
-  parser.add_argument('-a', '--action', dest='action', help='Set the script action', default="printalltags", choices=('printalltags','listtags','listrepos','deltag'))
-  parser.add_argument('-s','--silent', action='store_true', help="silent mode, don't print checks")
+    parser = argparse.ArgumentParser(description="Quay repository management script.")
+    parser.add_argument("-r", "--registry", required=True, help="Registry hostname[:port]")
+    parser.add_argument("-p", "--repo", dest="repository", help="Repository namespace/name")
+    parser.add_argument("-t", "--tag", help="Tag to work on")
+    parser.add_argument(
+        "-a",
+        "--action",
+        default="printalltags",
+        choices=("printalltags", "listtags", "listrepos", "deltag"),
+    )
+    parser.add_argument("-s", "--silent", action="store_true", help="Don't print checks")
+    parser.add_argument("--yes", action="store_true", help="Confirm deletion without prompting")
+    parser.add_argument(
+        "--dry-run", action="store_true", help="Show deletion URL without network access"
+    )
+    parser.add_argument("--token-file", help="Read bearer token from file (overrides QRM_TOKEN)")
+    args = parser.parse_args(argv)
+    match = re.fullmatch(
+        r"([A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?)(?::([0-9]+))?", args.registry
+    )
+    if not match or (match[2] and not 1 <= int(match[2]) <= 65535):
+        parser.error("registry must be a hostname with optional port 1..65535")
+    if (args.yes or args.dry_run) and args.action != "deltag":
+        parser.error("--yes and --dry-run require --action deltag")
+    if args.action in ("listtags", "deltag") and not args.repository:
+        parser.error("repository not defined")
+    if args.repository and (
+        len(args.repository.split("/")) != 2
+        or any(
+            part in ("", ".", "..") or any(ord(c) < 33 or ord(c) == 127 for c in part)
+            for part in args.repository.split("/")
+        )
+    ):
+        parser.error("repository must be namespace/name")
+    if args.action == "deltag" and not args.tag:
+        parser.error("tag not defined")
+    if args.tag is not None and (
+        args.tag in ("", ".", "..") or any(ord(c) < 33 or ord(c) == 127 for c in args.tag)
+    ):
+        parser.error("Invalid tag")
+    if args.action == "deltag":
+        if args.dry_run:
+            print(
+                json.dumps(
+                    {
+                        "dry_run": True,
+                        "method": "DELETE",
+                        "url": tagURL(args.registry, args.repository, args.tag),
+                    }
+                )
+            )
+            return
+        if not args.yes:
+            if not sys.stdin.isatty():
+                parser.error("deletion requires --yes or interactive confirmation")
+            print(
+                "Delete " + tagURL(args.registry, args.repository, args.tag) + "? Type yes: ",
+                file=sys.stderr,
+                end="",
+                flush=True,
+            )
+            if sys.stdin.readline().strip() != "yes":
+                parser.error("deletion cancelled")
+    try:
+        token = (
+            Path(args.token_file).read_text(encoding="utf-8").strip()
+            if args.token_file
+            else os.environ.get("QRM_TOKEN")
+        )
+    except (OSError, UnicodeError):
+        parser.error("Cannot read token file")
+    if token is not None and (not token or any(not 33 <= ord(c) <= 126 for c in token)):
+        parser.error("Invalid bearer token")
+    if token:
+        my_headers["Authorization"] = "Bearer " + token
+    try:
+        checkRegistry(args.registry, args.silent)
+        if args.action == "printalltags":
+            printAllTags(args.registry)
+        elif args.action == "listtags":
+            print(json.dumps(getRepoTags(args.registry, args.repository), indent=4))
+        elif args.action == "listrepos":
+            print(json.dumps(getRepos(args.registry, True), indent=4))
+        else:
+            print(json.dumps(deleteTag(args.registry, args.repository, args.tag), indent=4))
+    except ValueError as error:
+        print("ERROR: " + str(error), file=sys.stderr)
+        raise SystemExit(1) from None
+    finally:
+        my_headers.pop("Authorization", None)
 
-  args = parser.parse_args()
-
-  checkRegistry(args.registry)
-
-  if args.action == 'printalltags':
-    printAllTags(args.registry)
-  if args.action == 'listtags':
-    if args.repository:
-      print (json.dumps(getRepoTags(args.registry, args.repository), indent=4))
-    else:
-      sys.exit("ERROR: repository not defined")
-  if args.action == 'listrepos':
-    print (json.dumps(getRepos(args.registry, True), indent=4))
-  if args.action == 'deltag':
-    if args.repository:
-      if args.tag:
-        print(json.dumps(deleteTag(args.registry, args.repository, args.tag), indent=4))
-      else:
-        sys.exit("ERROR: tag not defined")
-    else:
-      sys.exit("ERROR: repository not defined")
 
 if __name__ == "__main__":
-
-  # calling main function
-  main(sys.argv)
+    main(sys.argv[1:])
