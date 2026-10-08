@@ -6,55 +6,60 @@ import sys
 
 
 def run(cmd):
-    return subprocess.check_output(cmd, shell=True, text=True).strip()
+    return subprocess.check_output(cmd, text=True, stderr=subprocess.PIPE).strip()
 
 
 def get_tags():
-    try:
-        tags = run("git tag --sort=-v:refname")
-        return tags.splitlines() if tags else []
-    except subprocess.CalledProcessError:
-        return []
+    tags = run(["git", "tag", "--sort=-v:refname"])
+    return tags.splitlines() if tags else []
 
 
 def get_log(range_expr):
-    try:
-      return run(f'git log {range_expr} --oneline --no-merges --no-decorate')
-    except subprocess.CalledProcessError:
-        return ""
+    revisions = [range_expr] if range_expr else []
+    return run(["git", "log", "--oneline", "--no-merges", "--no-decorate",
+                *revisions, "--"])
+
+
+def changelog(new_tag):
+    tags = get_tags()
+    lines = ["# Changelog", "", f"## {new_tag}"]
+    if not tags:
+        lines.append(get_log(""))
+        return "\n".join(lines) + "\n"
+
+    # Fully qualified refs prevent option injection and branch/path ambiguity.
+    lines.extend([get_log(f"refs/tags/{tags[0]}..HEAD"), ""])
+    for current, previous in zip(tags, tags[1:]):
+        lines.extend([f"## {current}",
+                      get_log(f"refs/tags/{previous}..refs/tags/{current}"), ""])
+    lines.extend([f"## {tags[-1]}", get_log(f"refs/tags/{tags[-1]}"), ""])
+    return "\n".join(lines) + "\n"
+
+
+USAGE = "Usage: gencl [heading]\nGenerate a changelog; heading labels HEAD (default: HEAD)."
 
 
 def main():
-    new_tag = sys.argv[1] if len(sys.argv) > 1 else "HEAD"
-    tags = get_tags()
-
-    print("# Changelog\n")
-
-    # ---- No tags at all ----
-    if not tags:
-        print(f"## {new_tag}")
-        print(get_log(""))
-        return
-
-    # ---- HEAD → latest tag ----
-    print(f"## {new_tag}")
-    print(get_log(f"{tags[0]}..HEAD"))
-    print()
-
-    # ---- tag → tag ----
-    for i in range(len(tags) - 1):
-        current = tags[i]
-        previous = tags[i + 1]
-
-        print(f"## {current}")
-        print(get_log(f"{previous}..{current}"))
-        print()
-
-    # ---- oldest tag → beginning ----
-    print(f"## {tags[-1]}")
-    print(get_log(tags[-1]))
-    print()
+    args = sys.argv[1:]
+    if args in (["-h"], ["--help"]):
+        print(USAGE)
+        return 0
+    if len(args) > 1 or (args and args[0].startswith("-")):
+        print(f"gencl: expected at most one heading\n{USAGE}", file=sys.stderr)
+        return 2
+    new_tag = args[0] if args else "HEAD"
+    try:
+        report = changelog(new_tag)
+    except subprocess.CalledProcessError as exc:
+        print(f"gencl: Git failed: {exc.stderr.strip()}", file=sys.stderr)
+        return 1
+    except OSError as exc:
+        print(f"gencl: cannot run Git: {exc}", file=sys.stderr)
+        return 1
+    # Do not publish a partial changelog if any Git command failed.
+    print(report, end="")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
