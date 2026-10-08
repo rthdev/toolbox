@@ -1,0 +1,343 @@
+#!/usr/bin/env python3
+"""
+mcm - Multi Cluster Management
+
+multi-cluster OpenShift CLI with:
+- Parallel execution
+- Clean login handling (no prompt collisions)
+- Single password prompt per user
+- Sorted output
+- Logout support
+"""
+
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import subprocess
+import sys
+import yaml
+import getpass
+import os
+
+from dataclasses import dataclass, asdict
+from pathlib import Path
+from typing import List, Dict
+
+CONFIG_PATH = Path.home() / ".mcm.yaml"
+DEFAULT_TIMEOUT = 30
+DEFAULT_WORKERS = 8
+
+password_cache: Dict[str, str] = {}
+
+
+# --------------------------------------------------
+# Data Model
+# --------------------------------------------------
+
+@dataclass
+class Cluster:
+    name: str
+    server: str
+    kubeconfig: str
+    username: str
+
+
+# --------------------------------------------------
+# Cluster Manager
+# --------------------------------------------------
+
+class ClusterManager:
+
+    def __init__(self, config_path: Path):
+        self.config_path = config_path
+        self.clusters: List[Cluster] = []
+        self._load()
+
+    def _load(self):
+        if not self.config_path.exists():
+            return
+
+        with open(self.config_path) as f:
+            data = yaml.safe_load(f) or {}
+
+        self.clusters = [Cluster(**c) for c in data.get("clusters", [])]
+
+    def _save(self):
+        with open(self.config_path, "w") as f:
+            yaml.safe_dump({"clusters": [asdict(c) for c in self.clusters]}, f)
+
+    def list(self) -> List[Cluster]:
+        return self.clusters
+
+    def add(self, name, server, kubeconfig, username):
+        if any(c.name == name for c in self.clusters):
+            raise ValueError("Cluster already exists")
+
+        self.clusters.append(
+            Cluster(name=name, server=server, kubeconfig=kubeconfig, username=username)
+        )
+        self._save()
+
+    def remove(self, name):
+        self.clusters = [c for c in self.clusters if c.name != name]
+        self._save()
+
+
+# --------------------------------------------------
+# Login Manager
+# --------------------------------------------------
+
+class LoginManager:
+
+    @staticmethod
+    def is_logged_in(cluster: Cluster) -> bool:
+        env = os.environ.copy()
+        env["KUBECONFIG"] = cluster.kubeconfig
+
+        result = subprocess.run(
+            ["oc", "whoami"],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+        return result.returncode == 0
+
+    @staticmethod
+    def get_password(username: str) -> str:
+        if username in password_cache:
+            return password_cache[username]
+
+        password = getpass.getpass(f"Password for '{username}': ")
+        password_cache[username] = password
+        return password
+
+    @staticmethod
+    def login(cluster: Cluster):
+        password = LoginManager.get_password(cluster.username)
+
+        env = os.environ.copy()
+        env["KUBECONFIG"] = cluster.kubeconfig
+
+        result = subprocess.run(
+            [
+                "oc",
+                "login",
+                cluster.server,
+                "-u",
+                cluster.username,
+                "-p",
+                password,
+                "--insecure-skip-tls-verify=true",
+            ],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip())
+
+    @staticmethod
+    def logout(cluster: Cluster):
+        env = os.environ.copy()
+        env["KUBECONFIG"] = cluster.kubeconfig
+        subprocess.run(["oc", "logout"], env=env)
+
+
+# --------------------------------------------------
+# Executor
+# --------------------------------------------------
+
+class CommandExecutor:
+
+    def __init__(self, clusters: List[Cluster], workers: int):
+        self.clusters = clusters
+        self.workers = workers
+
+    def _check_cluster(self, cluster: Cluster):
+        """
+        First pass: check login status only
+        """
+        try:
+            if not LoginManager.is_logged_in(cluster):
+                return {"cluster": cluster, "needs_login": True}
+            return {"cluster": cluster, "needs_login": False}
+        except Exception:
+            return {"cluster": cluster, "needs_login": True}
+
+    def _run(self, cluster: Cluster, command: str):
+
+        env = os.environ.copy()
+        env["KUBECONFIG"] = cluster.kubeconfig
+
+        try:
+            result = subprocess.run(
+                command,
+                shell=True,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=DEFAULT_TIMEOUT,
+            )
+
+            return {
+                "cluster": cluster.name,
+                "stdout": result.stdout.strip(),
+                "stderr": result.stderr.strip(),
+                "success": result.returncode == 0,
+            }
+
+        except subprocess.TimeoutExpired:
+            return {
+                "cluster": cluster.name,
+                "stdout": "",
+                "stderr": "Timeout contacting cluster",
+                "success": False,
+            }
+
+        except Exception as e:
+            return {
+                "cluster": cluster.name,
+                "stdout": "",
+                "stderr": str(e),
+                "success": False,
+            }
+
+    def run(self, command: str):
+
+        # ---- Phase 1: check login state (parallel)
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=self.workers
+        ) as executor:
+
+            check_results = list(
+                executor.map(self._check_cluster, self.clusters)
+            )
+
+        # ---- Phase 2: login (sequential + grouped by user)
+        clusters_needing_login = [r["cluster"] for r in check_results if r["needs_login"]]
+
+        if clusters_needing_login:
+            print("\nLogin required for clusters:")
+
+            for c in sorted(clusters_needing_login, key=lambda x: x.name):
+                print(f" - {c.name} ({c.username})")
+
+            print()
+
+            for c in clusters_needing_login:
+                print(f"Logging into {c.name}...")
+                LoginManager.login(c)
+
+        # ---- Phase 3: run command (parallel)
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=self.workers
+        ) as executor:
+
+            results = list(
+                executor.map(lambda c: self._run(c, command), self.clusters)
+            )
+
+        # ---- Sort results
+        results.sort(key=lambda x: x["cluster"])
+
+        return results
+
+
+# --------------------------------------------------
+# Output
+# --------------------------------------------------
+
+def print_table(results):
+
+    headers = ["Cluster", "Status", "Output"]
+
+    rows = []
+
+    for r in results:
+        status = "OK" if r["success"] else "ERROR"
+        output = (r["stdout"] or r["stderr"]).split("\n")[0]
+        rows.append([r["cluster"], status, output])
+
+    col_widths = [
+        max(len(str(row[i])) for row in ([headers] + rows))
+        for i in range(len(headers))
+    ]
+
+    def fmt(row):
+        return " | ".join(str(row[i]).ljust(col_widths[i]) for i in range(len(row)))
+
+    sep = "-+-".join("-" * w for w in col_widths)
+
+    print(fmt(headers))
+    print(sep)
+
+    for r in rows:
+        print(fmt(r))
+
+
+# --------------------------------------------------
+# CLI
+# --------------------------------------------------
+
+def main():
+
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="cmd")
+
+    add = sub.add_parser("add")
+    add.add_argument("name")
+    add.add_argument("server")
+    add.add_argument("kubeconfig")
+    add.add_argument("--user", required=True)
+
+    sub.add_parser("list")
+
+    rm = sub.add_parser("remove")
+    rm.add_argument("name")
+
+    sub.add_parser("logout")
+
+    exe = sub.add_parser("exec")
+    exe.add_argument("--command", required=True)
+    exe.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
+    exe.add_argument("--output", choices=["raw", "table"], default="raw")
+
+    args = parser.parse_args()
+    manager = ClusterManager(CONFIG_PATH)
+
+    if args.cmd == "add":
+        manager.add(args.name, args.server, args.kubeconfig, args.user)
+
+    elif args.cmd == "list":
+        for c in manager.list():
+            print(f"{c.name:20} {c.server} ({c.username})")
+
+    elif args.cmd == "remove":
+        manager.remove(args.name)
+
+    elif args.cmd == "logout":
+        for c in manager.list():
+            LoginManager.logout(c)
+            print(f"{c.name}: logged out")
+
+    elif args.cmd == "exec":
+        executor = CommandExecutor(manager.list(), args.workers)
+        results = executor.run(args.command)
+
+        if args.output == "table":
+            print_table(results)
+        else:
+            for r in results:
+                print(f"\n== {r['cluster']} ==")
+                print(r["stdout"] or r["stderr"])
+
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()
