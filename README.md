@@ -9,6 +9,11 @@ Commands intentionally have no `.sh` or `.py` extension.
 | --- | --- | --- |
 | [`ced`](linux/ced) | Quick TLS certificate expiration summary | Bash, OpenSSL, GNU coreutils |
 | [`certinfo`](linux/certinfo) | TLS certificate CN, issuer, expiration and SANs | Bash, OpenSSL, GNU coreutils |
+| [`findav`](linux/findav) | Find files starting with an Ansible Vault header | Bash, GNU findutils |
+| [`gencl`](linux/gencl) | Print a tag-grouped Git changelog | Python 3, Git |
+| [`qrm`](linux/qrm) | List Quay repositories/tags or attempt tag deletion | Python 3, Requests, Quay HTTPS API |
+| [`mcm`](openshift/mcm) | Store cluster entries and run shell commands across them | Python 3.9+, PyYAML, `oc`, shell |
+| [`ogn`](openshift/ogn) | List node capacity, roles, region and zone | Bash, `oc`, jq, awk |
 | [`lsswap`](linux/lsswap) | Top processes by swap usage in MiB | Bash, Linux `/proc`, awk, coreutils |
 | [`pls`](linux/pls) | Container owner/name hints from visible conmon processes | Bash, procps `ps`, text utilities |
 | [`kdf`](openshift/kdf) | Disk-free report for all PVCs and running pod mounts in a namespace | Bash, `kubectl`, jq, container `df` |
@@ -55,8 +60,15 @@ CONTRIBUTING.md        Development and branch/PR workflow
 ## Operational safety
 
 - Inspect scripts and test in a non-production environment before operational use.
-- Verify the target host, cluster, identity and namespace. Cluster tools use your
-  existing CLI credentials; they do not log in or switch contexts for you.
+- Verify the target host, cluster, identity and namespace. Read-only cluster
+  reporters use existing CLI credentials. `mcm` can log in and modify its configured
+  kubeconfigs; its shell command runs against **every registered cluster**.
+- `qrm -a deltag` attempts deletion without confirmation or dry-run; its current
+  deletion URL is malformed. `mcm exec` can run arbitrary destructive commands and
+  its automatic login disables TLS verification. Read the guide before use.
+- Do not assume `--help` is harmless or supported by every command: `ogn` ignores
+  arguments and queries the cluster; `gencl --help` generates a changelog instead.
+  `gencl` interpolates Git tag names into shell commands: use only trusted repos.
 - `kdf` executes `df` inside a container. `ocprems` reads cluster-scoped API request
   data. Neither needs a blanket cluster-admin grant; see the permission notes.
 - Certificate inspection is **not** certificate-chain or hostname verification.

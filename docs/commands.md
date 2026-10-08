@@ -2,9 +2,11 @@
 
 ## Common conventions
 
-Use **0** for success/help, **1** for operational failure, and **2** for invalid
-usage. Write results to stdout and diagnostics to stderr. `-h` and `--help`
-should display usage without connecting to a server or cluster.
+The standard convention is **0** for success/help, **1** for operational failure,
+and **2** for invalid usage, with results on stdout and diagnostics on stderr.
+Not every command implements it: see the individual exit-status notes below.
+In particular, `gencl` has no help option and `ogn` ignores all arguments (even
+`--help`) and queries the cluster. Read their entries before invoking them.
 
 Runtime baseline: Linux, Bash 4.4+, GNU coreutils/findutils and the command-specific
 dependencies below. Development checks additionally require Python 3.9+, Make and
@@ -62,6 +64,214 @@ On suitable terminals, less than 30 days is red, less than 90 yellow, otherwise
 green. Redirected output, `TERM=dumb`, an unset/empty `TERM`, or any set `NO_COLOR`
 disables colors. `tput` is optional. Dependencies are OpenSSL, GNU `timeout`,
 `mktemp`, `cat`, `rm` and GNU `date`; no trust or hostname validation is performed.
+
+## `findav`: locate Ansible Vault files
+
+```bash
+./linux/findav                         # current directory, not recursive
+./linux/findav --recursive ./roles
+./linux/findav ./group_vars/all.yml    # inspect one file
+./linux/findav -r -- ./-archive
+```
+
+Usage: `findav [-r|--recursive] [START_PATH]`; default path is `.`. Options must
+precede the path; `--` ends option parsing. `-h`/`--help` prints usage and exits 0.
+Requires Bash and `find` with `-maxdepth` and `-print0` (GNU findutils). No Ansible
+installation, Vault password or decryption is needed.
+
+Prints paths of readable regular files whose **first line starts exactly with
+`$ANSIBLE_VAULT;`**. This is only a header-prefix test, not validation of encrypted
+content; indented headers, later-line headers and inline `!vault` YAML values are
+not detected. Directory scans include hidden files and, by default, only direct
+children. Recursive scans do not follow directory symlinks; symlink files found
+within a directory are excluded by `find -type f`, although a directly supplied
+symlink to a regular file is inspected. Nothing is modified.
+
+Needs directory traversal/listing and file read permissions. Unreadable files are
+silently skipped; no matches (including an unreadable directly supplied regular
+file) returns 0. Invalid arguments return 2; nonexistent paths and paths that
+are neither regular files nor directories return 1. **Traversal errors from
+`find` are not propagated**, so exit 0 does not prove a complete scan. Output is
+unsorted and newline-delimited, not safe for unambiguous parsing of filenames
+containing newlines, despite null-delimited internal discovery.
+
+## `gencl`: changelog from Git tags
+
+```bash
+./linux/gencl
+./linux/gencl v2.0.0                   # heading only; does not create a tag
+```
+
+Usage: `gencl [HEADING]`. Requires Python 3 (standard library) and Git, with read
+access to a local repository. Runs Git in the **caller's working directory**.
+The first argument labels the newest section (default `HEAD`); it is not a Git
+revision selector. Further arguments are ignored. There are **no options or help
+handler**: `--help` is just another heading and still runs Git commands.
+
+Writes Markdown to stdout: `# Changelog`, followed by headings and the raw
+`git log --oneline --no-merges --no-decorate` output (abbreviated hashes and
+subjects, not Markdown bullets). Tags are ordered by descending version refname,
+not creation time or ancestry. The first section is the highest-version tag to
+HEAD, intermediate sections use adjacent tag ranges, and the oldest tag section
+contains history reachable from that tag. With no tags, prints non-merge history
+reachable from HEAD. Uncommitted changes are not included. Tags on divergent
+branches can produce surprising sections; no branch/release filtering is applied.
+
+No file, commit or tag is intentionally written. To save output, use shell
+redirection deliberately: `>` overwrites the selected destination. **Only run in
+trusted repositories:** tag names are interpolated unquoted into commands run
+with `shell=True`, allowing shell metacharacters in refs to execute local commands.
+The heading argument itself is printed, not used in these shell commands.
+
+Normal completion returns 0. Git failures are caught and replaced with empty tag
+lists/log text while Git diagnostics may appear on stderr; even a non-repository
+or missing Git can produce an incomplete changelog with exit 0. There is no
+reliable operational-failure exit contract or input validation.
+
+## `qrm`: Quay repository and tag requests
+
+```bash
+python3 linux/qrm --help
+python3 linux/qrm --registry quay.example.com --action listrepos
+python3 linux/qrm -r quay.example.com -a listtags -p team/application
+python3 linux/qrm -r quay.example.com        # printalltags (default)
+```
+
+Requires Python 3 and the `requests` package in that interpreter, DNS/network
+access to the Quay host on HTTPS port 443, and a trusted server certificate.
+Direct execution uses `/usr/bin/python3`, not necessarily the active virtualenv;
+use `python3 linux/qrm` to select your environment. Options:
+
+- `-r/--registry HOST` is required; supply a hostname, not a URL or path. The
+  connectivity check uses fixed port 443, so `HOST:PORT` is not supported.
+- `-a/--action {printalltags,listtags,listrepos,deltag}` defaults to `printalltags`.
+- `-p/--repo NAMESPACE/REPOSITORY` is required by `listtags` and `deltag`.
+- `-t/--tag TAG` is additionally required by `deltag`.
+- `-s/--silent` is accepted but **unused**; it does not suppress checks/output.
+- `-h/--help` exits 0 before network access (Requests must still be installed).
+
+Each action first prints connectivity/discovery checks to stdout: a TCP connection
+with a 10-second timeout, then `GET /api/v1/discovery`, which must return HTTP 200.
+Subsequent Requests calls, including discovery, have **no timeout**. The TCP-timeout
+case returns false from the check, but the caller ignores it and continues.
+
+`listrepos` requests public repositories (`public=True`) and prints JSON;
+`listtags` prints the repository's `tags` JSON; `printalltags` prints a Repository/
+Tags table with comma-separated tag names. **Pagination is incomplete:** all
+repository pages are fetched but only the first page is returned and displayed.
+Check messages precede JSON, so stdout is not a standalone JSON document.
+
+**Deletion is unsafe and currently malformed.** The syntax is
+`qrm -r HOST -a deltag -p NAMESPACE/REPOSITORY -t TAG`. It sends an HTTP DELETE
+immediately, with no confirmation or dry-run, using
+`/api/v1/repository/NAMESPACE/REPOSITORY/tagTAG` (missing the slash between `tag`
+and the supplied tag). Do not rely on it for deletion or treat the malformed URL
+as a safety mechanism. Repository/tag values are concatenated without URL encoding.
+There is no authentication/token option and no Authorization header is configured
+by the script. Without ambient Requests authentication (such as `.netrc`), listing
+requires anonymous access; deletion normally requires repository write/admin
+authorization. Do not assume the absence of CLI credential flags prevents a request
+from carrying credentials from the environment.
+
+Successful completion returns 0; argparse usage failures return 2. Missing required
+action-specific arguments, failed discovery and uncaught network/JSON/key errors
+normally return 1. Action responses are decoded as JSON without checking HTTP
+status, so an API error JSON may be printed with exit 0, while an empty successful
+DELETE response can raise a JSON error. Output and exit status alone do not
+establish successful deletion; verify independently in Quay.
+
+## `mcm`: multi-cluster shell execution
+
+```bash
+./openshift/mcm --help
+./openshift/mcm add staging https://api.staging.example.com:6443 "$HOME/.kube/staging" --user alice
+./openshift/mcm list
+./openshift/mcm exec --command 'oc get nodes' --workers 4 --output table
+./openshift/mcm remove staging
+```
+
+Requires Python 3.9+, PyYAML (`yaml` import), `oc` for cluster operations, and a
+shell/the commands being executed. Stores registrations in `~/.mcm.yaml`; no
+config-path override is available. Subcommands:
+
+- `add NAME SERVER KUBECONFIG --user USER`: adds an entry and rewrites the YAML
+  file; duplicate names raise an error. Does not contact or validate the cluster.
+- `list`: prints registered names, servers and usernames (not kubeconfig paths).
+- `remove NAME`: rewrites the YAML without that name; an absent name is not an
+  error. Does not delete the kubeconfig or log out.
+- `logout`: runs `oc logout` sequentially for **every** registration, using each
+  configured kubeconfig. This can invalidate sessions and modifies login state.
+- `exec --command SHELL_COMMAND [--workers N] [--output raw|table]`: executes on
+  **every** registration; no cluster selector or exclusion option. Defaults are
+  eight workers and `raw`. Workers must be positive for execution to work, but
+  argparse only checks that the value is an integer.
+
+Top-level and subcommand `-h/--help` are local and return 0 before reading config.
+Invoking `mcm` without a subcommand loads config and then displays help. A missing
+config means an empty list; an `exec` against it can succeed without running
+anything. YAML entries must have `name`, `server`, `kubeconfig` and `username`
+fields. Paths are stored verbatim:
+use absolute kubeconfig paths and let your invoking shell expand `$HOME`; literal
+`~` inside a stored path is not expanded by this script.
+
+Before execution, `oc whoami` checks run in parallel. Any failure triggers sequential
+login, with one password prompt per username and an in-memory password cache for
+that process. **Automatic login passes the password as an `oc -p` command-line
+argument and always sets `--insecure-skip-tls-verify=true`.** This exposes credentials
+to applicable process observers and disables server certificate verification;
+use only controlled, trusted environments. Existing successful `whoami` is accepted
+without checking it matches the registered server or username. Inspect each
+kubeconfig/context yourself; registration is not proof of the actual target.
+
+Commands run through `shell=True` locally, with that entry's `KUBECONFIG` environment
+variable. They are not automatically prefixed with `oc` and are not remote shell
+sessions. Quote the command as one argument; never interpolate untrusted input.
+**There is no confirmation, dry-run, rollback or read-only restriction.** Destructive
+`oc` commands affect all registered targets, while local file operations repeat on
+the same machine and may race. Login can rewrite configured kubeconfigs; shared
+kubeconfig paths can also cause interference. The registration file is overwritten
+without locking, backup or explicit restrictive permissions. Protect config and
+kubeconfig files yourself; permissions/RBAC must cover the exact requested commands,
+not a blanket cluster-admin grant.
+
+Execution is parallel, but results are buffered and printed sorted by cluster name.
+Each shell command has a fixed 30-second subprocess timeout, with no CLI override;
+login, login checks and logout have no such timeout, and shell descendants are not
+guaranteed to stop on timeout. `raw` prints stdout if nonempty, otherwise stderr,
+without a status field. `table` adds OK/ERROR but shows only the first line of the
+same selected stream; neither displays both streams when stdout is present.
+
+Help/normal completion returns 0 and argparse usage errors return 2. **Failed or
+timed-out per-cluster commands still leave the overall exit code 0.** Logout ignores
+`oc` return codes and can print `logged out` on failure. Uncaught config, login,
+duplicate-name or invalid-worker errors normally return 1. A login failure stops
+execution before the command phase; earlier successful logins are not undone.
+
+## `ogn`: node roles and topology
+
+```bash
+./openshift/ogn
+```
+
+Requires Bash, a configured/authenticated `oc`, jq and awk, with cluster-scoped
+permission to list nodes. Runs `oc get nodes -o json` against the current context;
+no resources are modified. **There are no options or help handler:** all arguments,
+including `--help`, are ignored and still cause a cluster query.
+
+Prints NAME, ROLES, CPU, MEMORY, REGION and ZONE in a whitespace-aligned table.
+CPU and memory are raw `status.capacity` strings (not allocatable, requests or
+usage), without unit conversion. Missing capacity/topology values show `N/A`.
+Roles recognize only `node-role.kubernetes.io/master`, `infra` and `worker` labels,
+joined in that order; a `control-plane` label alone is not recognized. Missing
+recognized roles produce an empty field. Nodes are ordered master first, then
+infra, then all remaining nodes, followed by region and zone within each group;
+there is no explicit name tie-breaker. Multi-role nodes use master/infra priority.
+
+Column widths are minimums, so long names/values may shift alignment. An empty
+node list prints just the header. The script has no `pipefail` or explicit error
+handling: exit status comes from the final awk stage. An `oc` or jq failure can
+therefore leave a header-only report and exit 0 with upstream diagnostics on stderr.
+Do not interpret empty output or exit 0 as proof of a successful query.
 
 ## `lsswap`: process swap use
 
