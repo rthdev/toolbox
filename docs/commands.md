@@ -2,9 +2,12 @@
 
 ## Common conventions
 
-Use **0** for success/help, **1** for operational failure, and **2** for invalid
-usage. Write results to stdout and diagnostics to stderr. `-h` and `--help`
-should display usage without connecting to a server or cluster.
+The standard convention is **0** for success/help, **1** for operational failure,
+and **2** for invalid usage, with results on stdout and diagnostics on stderr.
+Check each command's guide for exceptions: `ogn` preserves external-command
+failure statuses, and `mcm` does not propagate per-cluster command failures to its
+exit status. The commands documented here support local `-h`/`--help` without
+server or cluster access; Python imports still require installed runtime packages.
 
 Runtime baseline: Linux, Bash 4.4+, GNU coreutils/findutils and the command-specific
 dependencies below. Development checks additionally require Python 3.9+, Make and
@@ -62,6 +65,69 @@ On suitable terminals, less than 30 days is red, less than 90 yellow, otherwise
 green. Redirected output, `TERM=dumb`, an unset/empty `TERM`, or any set `NO_COLOR`
 disables colors. `tput` is optional. Dependencies are OpenSSL, GNU `timeout`,
 `mktemp`, `cat`, `rm` and GNU `date`; no trust or hostname validation is performed.
+
+## `findav`: locate Ansible Vault files
+
+```bash
+./linux/findav                         # current directory, not recursive
+./linux/findav -r -0 ./roles            # recursive, NUL-terminated paths
+```
+
+Read-only first-line Vault header detection; no Ansible installation or password
+is needed. Requires Bash, GNU findutils and coreutils. See the [findav guide](findav.md)
+for path/symlink handling, output delimiters and incomplete-scan failures.
+
+## `gencl`: changelog from Git tags
+
+```bash
+./linux/gencl                          # run within the target Git repository
+./linux/gencl 'Next release'           # heading only; does not create a tag
+```
+
+Requires Python 3 and Git. Generates Markdown from the caller's local repository,
+without modifying tags or commits. See the [gencl guide](gencl.md) for tag ordering,
+revision ranges, argument validation and failure handling.
+
+## `qrm`: Quay repository and tag requests
+
+```bash
+python3 linux/qrm --help
+python3 linux/qrm -r quay.example.com -a listtags -p team/application
+python3 linux/qrm -r quay.example.com -a deltag -p team/application -t old --dry-run
+```
+
+Requires Python 3.9+ and Requests. Use `python3 linux/qrm` to select your Python
+environment; direct execution uses `/usr/bin/python3`. Read actions use HTTPS;
+deletion requires confirmation or `--yes`, while `--dry-run` is network-free.
+See the [qrm guide](qrm.md) for authentication, permissions, pagination, timeouts
+and output/exit-status contracts.
+
+## `mcm`: multi-cluster shell execution
+
+```bash
+./openshift/mcm --help
+./openshift/mcm list
+```
+
+Requires Python 3.9+ and PyYAML, plus `oc` and the shell commands used for cluster
+operations. Registrations live in `~/.mcm.yaml`. **`exec` runs on every registered
+cluster without confirmation or dry-run**, and automatic login disables TLS
+verification and exposes the password as a process argument. Per-cluster command
+failures do not make the overall exit status nonzero. Read the [mcm guide](mcm.md)
+for registration, target checks, login/logout effects and output limitations before
+running commands.
+
+## `ogn`: node roles and topology
+
+```bash
+./openshift/ogn --help
+./openshift/ogn
+```
+
+Requires Bash, an authenticated `oc`, jq and awk, with permission to list nodes.
+Reports raw node capacity, recognized roles, region and zone without modifying
+resources. See the [ogn guide](ogn.md) for role precedence, topology sorting,
+alignment and failure/empty-result semantics.
 
 ## `lsswap`: process swap use
 
@@ -218,7 +284,8 @@ or other Python package is required. It never changes contexts or cluster resour
   matching nodes, including NotReady/cordoned nodes. Reports the worst CPU/memory
   node names (which can differ). A single available node leaves zero effective
   N-1 capacity; negative free values are retained. No available nodes shows `none`
-  for the worst-node names.
+  for the worst-node names. All matching roles share one table, one header and
+  common column widths; no matching nodes produces an explicit message instead.
 
 `--node-role {control,infra,worker}` and `--label SELECTOR` apply to nodes in every
 mode; pod reports then include only pods assigned to those nodes. `--label` is
@@ -285,6 +352,9 @@ Snapshots and metrics windows are not atomic and may disagree during changes.
 Capacity values at or above 60% of allocatable are red only on a suitable TTY.
 Redirected output, `TERM=dumb`, an unset/empty `TERM`, or any set `NO_COLOR` disables
 color. Tables are plain aligned Markdown with no terminal-library dependency.
+CPU_/MEM_ columns, including headers and totals, are right-aligned; identifiers
+are left-aligned. Unknown usage and other text in resource columns retain that
+same alignment.
 
 ### Collection, permissions and failures
 

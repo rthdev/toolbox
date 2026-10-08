@@ -3,6 +3,9 @@
 `linux/qrm` is a standalone Python 3.9+ script requiring `requests`. Install
 `requests` into the Python environment used to run it; the repository's
 `requirements-dev.txt` includes tested versions for the CI Python versions.
+Direct execution uses `/usr/bin/python3`; invoke `python3 linux/qrm` to select
+your Python environment. `python3 linux/qrm --help` exits 0 without network
+access, but Requests must be installed even for help or dry-run.
 No cluster client or other toolbox command is required.
 
 ## Read-only actions
@@ -80,6 +83,7 @@ may already have completed deletion, so inspect its state before retrying.
 
 ## Failure and output contract
 
+- Successful actions, dry-run and help exit 0.
 - Arguments are validated before network access. Usage/cancellation errors exit 2;
   HTTP, connectivity, malformed JSON, and schema failures exit 1.
 - Each request has a 5-second connection timeout and 30-second read timeout.
