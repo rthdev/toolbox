@@ -1,0 +1,514 @@
+#!/usr/bin/env python3
+"""Read-only key reference evidence, not a complete reference-count audit.
+
+Run: sudo drgn -k ./linux/keyrefs HEX_SERIAL...
+Dump: drgn -c vmcore -s vmlinux ./linux/keyrefs HEX_SERIAL...
+"""
+import argparse
+import json
+import os
+import sys
+
+
+class Report:
+    """Keep structural edges separate from observations and pointer candidates."""
+
+    def __init__(self, serials):
+        self.serials = serials
+        self.keys = {}
+        self.edges = {}
+        self.holders = {}
+        self.warnings = []
+        self.reverse = {"enabled": False, "candidates": [], "bytes": 0, "objects": 0}
+
+    def add_key(self, serial, address, description, uid, usage):
+        self.keys[address] = {"serial": "%08x" % serial, "address": hex(address),
+                              "description": description, "uid": uid, "usage": usage}
+        self.edges[address] = set()
+        self.holders[address] = {}
+
+    def observe(self, key, edge, holder, owning=True):
+        if owning:
+            self.edges[key].add(edge)
+        row = dict(holder, edge=list(edge), owning=owning)
+        self.holders[key][json.dumps(row, sort_keys=True)] = row
+
+    def warn(self, message):
+        if message not in self.warnings:
+            self.warnings.append(message)
+
+    @property
+    def exit_code(self):
+        return 3 if self.warnings else 0
+
+    def as_dict(self):
+        keys = []
+        for address, key in sorted(self.keys.items(), key=lambda pair: pair[1]["serial"]):
+            keys.append(dict(key, structural_refs=len(self.edges[address]),
+                             holders=list(self.holders[address].values())))
+        found = {key["serial"] for key in keys}
+        return {"schema_version": 1, "status": "partial" if self.warnings else "complete",
+                "scope": "selected scans; not a complete reference-count audit",
+                "keys": keys, "missing_serials": ["%08x" % s for s in self.serials
+                                                   if "%08x" % s not in found],
+                "warnings": self.warnings, "reverse": self.reverse}
+
+
+def render(report, verbose=False):
+    data = report.as_dict()
+    lines = ["Selected scan status: " + data["status"]]
+    for serial in data["missing_serials"]:
+        label = "NOT RESOLVED: " if data["status"] == "partial" else "NOT IN SERIAL TREE: "
+        lines.append(label + serial)
+    for key in data["keys"]:
+        description = ascii(key["description"]) if key["description"] is not None else "<unavailable>"
+        uid = key["uid"] if key["uid"] is not None else "<unavailable>"
+        usage = key["usage"] if key["usage"] is not None else "<unavailable>"
+        lines.append("\nKey %s %s — owner UID %s" % (key["serial"], description, uid))
+        lines.append("  References: %d observed; kernel count: %s." % (key["structural_refs"], usage))
+        if verbose:
+            lines.append("  key=" + key["address"])
+        for holder in key["holders"]:
+            fields = []
+            for name, value in holder.items():
+                if name in ("edge", "owning") or (not verbose and name.endswith("_address")):
+                    continue
+                fields.append("%s=%s" % (name, ascii(value) if isinstance(value, str) else value))
+            lines.append("  " + " ".join(fields))
+            if verbose:
+                lines.append("    edge=" + repr(holder["edge"]))
+        if not key["holders"]:
+            lines.append("  UNKNOWN HOLDER: no holder identified in selected scans.")
+        if key["usage"] is not None and key["structural_refs"] != key["usage"]:
+            lines.append("  Counts differ: unscanned references or live-read races may explain this.")
+    if data["reverse"]["enabled"]:
+        lines.append("\nAllocated pointer candidates (NOT proven owning references):")
+        for hit in data["reverse"]["candidates"]:
+            lines.append("  " + json.dumps(hit, sort_keys=True))
+    lines.extend("INCOMPLETE: " + ascii(warning) for warning in data["warnings"])
+    lines.append("\nShared credentials count once per field. This is not a complete reference-count audit.")
+    lines.append("Live reads can race. UNKNOWN HOLDER and pointer candidates do not prove a leak.")
+    return "\n".join(lines) + "\n"
+
+
+def write_output(path, text):
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+        stream.write(text)
+
+
+
+def hex_serial(text):
+    value = text[2:] if text.startswith(("0x", "0X")) else text
+    if not value or len(value) > 8 or any(c not in "0123456789abcdefABCDEF" for c in value):
+        raise argparse.ArgumentTypeError("invalid hexadecimal serial: " + text)
+    number = int(value, 16)
+    if not 0 < number <= 0x7fffffff:
+        raise argparse.ArgumentTypeError("serial must be positive and <= 7fffffff")
+    return number
+
+
+def positive(text):
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError("expected a positive integer") from None
+    if value <= 0:
+        raise argparse.ArgumentTypeError("expected a positive integer")
+    return value
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("serial", nargs="+", type=hex_serial, help="HEX serial from /proc/keys")
+    for flag, help_text in (
+        ("maps", "scan mapped-file credentials"),
+        ("slab", "scan allocated cred_jar objects"),
+        ("files", "scan allocated filp objects, including deferred candidates"),
+        ("deep", "enable maps, slab and files (not reverse)"),
+        ("reverse", "bounded allocated-slab pointer search; implies slab"),
+        ("verbose", "show kernel addresses"),
+        ("json", "emit JSON instead of human text"),
+    ):
+        parser.add_argument("--" + flag, action="store_true", help=help_text)
+    parser.add_argument("--cache", action="append", default=[], help="reverse cache name; repeatable")
+    parser.add_argument("--max-bytes", type=positive, default=67108864, help="reverse payload bytes (default 67108864)")
+    parser.add_argument("--max-objects", type=positive, default=250000, help="reverse allocations (default 250000)")
+    parser.add_argument("--max-hits", type=positive, default=1000, help="reverse candidates (default 1000)")
+    parser.add_argument("--timeout", type=positive, default=60, help="reverse seconds, cooperative (default 60)")
+    parser.add_argument("--output", metavar="FILE", help="also exclusively create private report file")
+    args = parser.parse_args(argv)
+    if args.cache and not args.reverse:
+        parser.error("--cache requires --reverse")
+    args.serial = sorted(set(args.serial))
+    args.maps = args.maps or args.deep
+    args.files = args.files or args.deep
+    args.slab = args.slab or args.deep or args.reverse
+    return args
+
+
+def snapshot(pointer):
+    # drgn member pointers are lazy memory references. Pin the slot's value
+    # before using its address and dereferencing it; plain offline fakes are stable.
+    read = getattr(pointer, "read_", None)
+    return read() if read is not None else pointer
+
+
+def counter(value):
+    try:
+        return int(value.refs.counter)
+    except AttributeError:
+        return int(value.counter)
+
+
+def decode(value):
+    return value.decode("utf-8", "backslashreplace")
+
+
+def keyring_leaves(backend, root):
+    # Metadata bit 0 distinguishes nodes; bit 1 tags shortcuts AND keyring leaves.
+    pending, seen = [int(root)], set()
+    while pending:
+        pointer = pending.pop()
+        if not pointer:
+            continue
+        if pointer in seen:
+            raise RuntimeError("repeated assoc_array pointer: race or corruption")
+        seen.add(pointer)
+        if not pointer & 1:
+            yield pointer & ~3
+        elif pointer & 2:
+            node = backend.object("struct assoc_array_shortcut *", pointer & ~3)
+            pending.append(int(node.next_node))
+        else:
+            node = backend.object("struct assoc_array_node *", pointer & ~3)
+            pending.extend(int(slot) for slot in node.slots)
+
+
+class Collector:
+    def __init__(self, backend, report, progress):
+        self.backend = backend
+        self.report = report
+        self.progress = progress
+        self.known_creds = set()
+        self.slab_creds = set()
+
+    def guarded(self, label, function):
+        try:
+            return function()
+        except Exception as error:
+            self.report.warn(label + ": " + str(error))
+        return None
+
+    def each(self, label, iterable, function):
+        self.progress(label)
+        def scan():
+            for index, item in enumerate(iterable()):
+                self.guarded(label, lambda: function(item))
+                if index and index % 10000 == 0:
+                    self.progress(label + ": %d objects" % index)
+        self.guarded(label, scan)
+
+    def cred(self, cred, holder, owning=True):
+        cred = snapshot(cred)
+        address = int(cred)
+        if not address:
+            return False
+        matched = False
+        usage = counter(cred.usage)
+        for field in ("session_keyring", "process_keyring", "thread_keyring", "request_key_auth"):
+            key = int(getattr(cred, field))
+            if key in self.report.keys:
+                row = dict(holder, cred_address=hex(address), cred_usage=usage, field=field)
+                self.report.observe(key, ("cred", address, field), row, owning and usage > 0)
+                matched = True
+        if matched and owning:
+            self.known_creds.add(address)
+        return matched
+
+    def file(self, file, holder):
+        file = snapshot(file)
+        if not file:
+            return
+        cred = snapshot(file.f_cred)
+        fields = ("session_keyring", "process_keyring", "thread_keyring", "request_key_auth")
+        if not cred or not any(int(getattr(cred, field)) in self.report.keys for field in fields):
+            return
+        count = counter(file.f_count)
+        row = dict(holder, file_address=hex(int(file)), file_count=count,
+                   state="referenced" if count > 0 else "deferred candidate")
+        try:
+            row["path"] = self.backend.path(file)
+        except Exception as error:
+            row["path"] = "<path unavailable>"
+            self.report.warn("file path: " + str(error))
+        self.cred(cred, row, count > 0)
+
+    def task(self, task, maps):
+        label = {"pid": int(task.tgid), "tid": int(task.pid), "comm": decode(task.comm.string_())}
+        for field in ("cred", "real_cred"):
+            self.guarded("task " + field,
+                         lambda: self.cred(getattr(task, field), dict(label, kind="process")))
+        if task.files:
+            def files():
+                for fd, file in self.backend.files(task):
+                    self.guarded("open file", lambda: self.file(file, dict(label, kind="open_file", fd=int(fd))))
+            self.guarded("FD table", files)
+        if maps:
+            def mappings():
+                for vma in self.backend.vmas(task):
+                    self.guarded("mapped file", lambda: self.file(vma.vm_file, dict(label, kind="mapped_file")))
+            self.guarded("VMAs", mappings)
+
+    def parent(self, parent):
+        if not self.backend.is_keyring(parent):
+            return
+        label = {"parent_serial": "%08x" % int(parent.serial),
+                 "parent_address": hex(int(parent)), "description": decode(parent.description.string_())}
+        for address in keyring_leaves(self.backend, parent.keys.root):
+            if address in self.report.keys:
+                self.report.observe(address, ("link", int(parent)), dict(label, kind="keyring"))
+        restriction = snapshot(parent.restrict_link)
+        if restriction:
+            key = int(restriction.key)
+            if key in self.report.keys:
+                self.report.observe(key, ("restriction", int(parent)), dict(label, kind="restriction"))
+
+    def slab_cred(self, cred):
+        cred = snapshot(cred)
+        address = int(cred)
+        # Only matched credentials become reverse targets; zero-count objects are candidates.
+        if address in self.known_creds:
+            self.slab_creds.add(address)
+        elif self.cred(cred, {"kind": "unknown_credential", "state": "UNKNOWN HOLDER"}):
+            self.slab_creds.add(address)
+
+
+def collect(backend, args, report, progress):
+    collector = Collector(backend, report, progress)
+    keys = []
+    def discover(key):
+        key = snapshot(key)
+        keys.append(key)
+        serial = int(key.serial)
+        if serial in args.serial:
+            address = int(key)
+            # Retain identity even if optional metadata faults or is interrupted.
+            report.add_key(serial, address, None, None, None)
+            for field, read in (("description", lambda: decode(key.description.string_())),
+                                ("uid", lambda: int(key.uid.val)),
+                                ("usage", lambda: counter(key.usage))):
+                report.keys[address][field] = collector.guarded("key %08x %s" % (serial, field), read)
+    collector.each("Resolving key serials", backend.keys, discover)
+    if not report.keys:
+        return
+    collector.each("Scanning task threads and open files", backend.tasks,
+                   lambda task: collector.task(task, args.maps))
+    collector.each("Scanning incoming keyring links and restrictions", lambda: keys, collector.parent)
+    if args.files:
+        collector.each("Scanning allocated filp", lambda: backend.allocated("filp", "struct file"),
+                       lambda file: collector.file(file, {"kind": "allocated_file"}))
+    if args.slab:
+        collector.each("Scanning allocated cred_jar", lambda: backend.allocated("cred_jar", "struct cred"),
+                       collector.slab_cred)
+    if args.reverse:
+        targets = {address: "key" for address in report.keys}
+        targets.update({address: "cred" for address in collector.slab_creds})
+        scan_reverse(backend, args, report, targets, progress)
+
+
+def pointer_matches(payload, start, width, byteorder, targets):
+    # Alignment is in the target address space, not merely relative to the buffer.
+    for offset in range((-start) % width, len(payload) - width + 1, width):
+        address = int.from_bytes(payload[offset:offset + width], byteorder)
+        if address in targets:
+            yield offset, address
+
+
+def scan_reverse(backend, args, report, targets, progress, clock=None):
+    import time
+    clock = clock or time.monotonic
+    started = clock()
+    stats = report.reverse
+    stats["enabled"] = True
+    stats["cache_filter"] = list(dict.fromkeys(args.cache))
+    stats["limits"] = {"bytes": args.max_bytes, "objects": args.max_objects,
+                       "hits": args.max_hits, "seconds": args.timeout}
+    seen_caches, seen_objects = set(), set()
+
+    def limit():
+        if clock() - started >= args.timeout:
+            return "timeout"
+        if stats["objects"] >= args.max_objects:
+            return "max-objects"
+        if stats["bytes"] >= args.max_bytes:
+            return "max-bytes"
+        if len(stats["candidates"]) >= args.max_hits:
+            return "max-hits"
+        return None
+
+    def stop(reason):
+        report.warn("reverse truncated: " + reason)
+
+    try:
+        for cache in backend.caches(args.cache):
+            if int(cache) in seen_caches:
+                continue
+            seen_caches.add(int(cache))
+            reason = limit()
+            if reason:
+                stop(reason)
+                return
+            name = "<unreadable cache>"
+            try:
+                name = decode(cache.name.string_())
+                size = int(cache.object_size)
+                if size <= 0:
+                    raise RuntimeError("invalid object_size")
+                progress("Reverse allocated cache " + ascii(name))
+                objects = iter(backend.objects(cache))
+                while True:
+                    # next() can traverse slab metadata, so check before asking
+                    # the helper for another allocation, not just before read().
+                    reason = limit()
+                    if reason:
+                        stop(reason)
+                        return
+                    if size > args.max_bytes - stats["bytes"]:
+                        stop("max-bytes (next allocation exceeds remaining budget)")
+                        return
+                    try:
+                        obj = next(objects)
+                    except StopIteration:
+                        break
+                    reason = limit()
+                    if reason:
+                        stop(reason)
+                        return
+                    address = int(obj)
+                    if address in seen_objects:
+                        continue
+                    seen_objects.add(address)
+                    stats["objects"] += 1
+                    stats["bytes"] += size
+                    try:
+                        payload = backend.read(address, size)
+                        if len(payload) != size:
+                            raise RuntimeError("short allocation read")
+                        for offset, target in pointer_matches(payload, address, backend.pointer_size,
+                                                              backend.byteorder, targets):
+                            stats["candidates"].append({"cache": name, "allocation": hex(address),
+                                "size": size, "match_address": hex(address + offset), "offset": offset,
+                                "target_kind": targets[target], "target_address": hex(target), "owning": False})
+                            if len(stats["candidates"]) >= args.max_hits:
+                                stop("max-hits")
+                                return
+                    except Exception as error:
+                        report.warn("reverse allocation %s: %s" % (hex(address), error))
+                    if stats["objects"] % 10000 == 0:
+                        progress("Reverse: %d allocations, %d bytes" % (stats["objects"], stats["bytes"]))
+                reason = limit()
+                if reason:
+                    stop(reason)
+                    return
+            except Exception as error:
+                report.warn("reverse skipped cache %s: %s" % (name, error))
+    except Exception as error:
+        report.warn("reverse cache enumeration: " + str(error))
+
+
+class DrgnBackend:
+    """Lazy drgn boundary; all member layouts come from target debug information."""
+
+    def __init__(self, program):
+        from drgn import PlatformFlags
+        self.prog = program
+        if program.platform is None:
+            raise RuntimeError("target platform is unknown")
+        self.pointer_size = program.type("void *").size
+        self.byteorder = "little" if program.platform.flags & PlatformFlags.IS_LITTLE_ENDIAN else "big"
+
+    def keys(self):
+        from drgn.helpers.linux.rbtree import rbtree_inorder_for_each_entry
+        return rbtree_inorder_for_each_entry("struct key", self.prog["key_serial_tree"].address_of_(), "serial_node")
+
+    def tasks(self):
+        from drgn.helpers.linux.pid import for_each_task
+        return for_each_task(self.prog)
+
+    def files(self, task):
+        from drgn.helpers.linux.fs import for_each_file
+        return for_each_file(task)
+
+    def vmas(self, task):
+        from drgn.helpers.linux.mm import for_each_vma
+        mm = snapshot(task.mm)
+        return for_each_vma(mm) if mm else ()
+
+    def path(self, file):
+        from drgn.helpers.linux.fs import d_path
+        return decode(d_path(file.f_path))
+
+    def is_keyring(self, key):
+        return int(key.type) == int(self.prog["key_type_keyring"].address_of_())
+
+    def object(self, type_name, address):
+        from drgn import Object
+        return Object(self.prog, type_name, value=address)
+
+    def caches(self, names):
+        from drgn.helpers.linux.slab import find_slab_cache, for_each_slab_cache
+        if not names:
+            yield from for_each_slab_cache(self.prog)
+        else:
+            for name in dict.fromkeys(names):
+                cache = find_slab_cache(self.prog, name)
+                if cache is None or not cache:
+                    raise RuntimeError("slab cache not found: " + name)
+                yield cache
+
+    def allocated(self, name, type_name):
+        from drgn.helpers.linux.slab import slab_cache_for_each_allocated_object
+        for cache in self.caches([name]):
+            yield from slab_cache_for_each_allocated_object(cache, type_name)
+
+    def objects(self, cache):
+        from drgn.helpers.linux.slab import slab_cache_for_each_allocated_object
+        return slab_cache_for_each_allocated_object(cache, "char")
+
+    def read(self, address, size):
+        return self.prog.read(address, size)
+
+
+def main(argv=None, program=None):
+    args = parse_args(argv)
+    if program is None:
+        print("keyrefs: run with drgn -k or drgn -c vmcore -s vmlinux", file=sys.stderr)
+        return 1
+    report = Report(args.serial)
+    def progress(message):
+        print(message, file=sys.stderr, flush=True)
+    try:
+        backend = DrgnBackend(program)
+    except Exception as error:
+        progress("keyrefs: " + ascii(str(error)))
+        return 1
+    try:
+        collect(backend, args, report, progress)
+    except KeyboardInterrupt:
+        report.warn("interrupted; retained evidence is partial")
+    text = json.dumps(report.as_dict(), indent=2, sort_keys=True) + "\n" if args.json else render(report, args.verbose)
+    try:
+        # Always retain stdout even when saving the optional report fails.
+        sys.stdout.write(text)
+        if args.output:
+            write_output(args.output, text)
+    except OSError as error:
+        progress("keyrefs output: " + ascii(str(error)))
+        return 1
+    return report.exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main(program=globals().get("prog")))
