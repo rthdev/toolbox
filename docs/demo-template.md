@@ -1,5 +1,14 @@
 # Workflow demo template
 
+**Use at your own risk.** The person executing a template or a copied/modified
+script is responsible for its commands and consequences. Scripts are provided
+as-is, without warranty; authors and contributors accept no liability for damage,
+data loss or service interruption. The runner is not a sandbox.
+
+Concrete workflow demos live in [`demos/`](../demos/); see the
+[demo guide](demos.md) before using them. Unlike the template example, they can
+install software, create resources and delete data.
+
 Copy `templates/demo-template.sh` wherever you prepare your demos:
 
 ```bash
@@ -86,9 +95,10 @@ is displayed and waits, leaving previous output visible.
 - Do not enable `set -e` or change runner helpers, traps or reserved `demo_*`
   helper variables from your snippets. Explicit `exit`, `exec`, fatal shell
   errors or signals can still terminate the script. This is not error isolation.
-- The shipped example is read-only. The commented redirection example would
-  create or overwrite `demo.txt` if enabled. Nothing rolls back or cleans up
-  executed commands when you quit; add explicit cleanup steps if needed.
+- The example in `templates/demo-template.sh` is read-only. The commented
+  redirection example would create or overwrite `demo.txt` if enabled. Nothing
+  rolls back or cleans up executed commands when you quit; add explicit cleanup
+  steps if needed.
 - Commands and section headings are bold; commentary and failure statuses are dim.
   Command output is untouched. Styling is disabled for redirected output, an
   unset/empty/dumb `TERM`, or any set `NO_COLOR` (including an empty value).

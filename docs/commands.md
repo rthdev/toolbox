@@ -1,5 +1,12 @@
 # Command guide
 
+**Use at your own risk.** The person executing any script is responsible for its
+use and consequences. Scripts are provided as-is, without warranty; authors and
+contributors accept no liability for resulting damage, data loss or service
+interruption. Read the [operational safety guidance](../README.md#operational-safety)
+and inspect commands before execution. This also applies to [demos](demos.md)
+and [templates](demo-template.md).
+
 ## Common conventions
 
 The standard convention is **0** for success/help, **1** for operational failure,
@@ -381,4 +388,18 @@ namespace-aware metrics, effective label filtering, explicit missing usage,
 bounded/error-checked collection, mode-specific argument validation, TTY-safe
 color, and conservative N-1 wording/available-node handling. `ptop -n` now scopes
 the report rather than ignoring the namespace. These are reports, not a stable
-machine-readable output API. The original executable is unchanged.
+machine-readable output API.
+
+### Migrating from `ocptool`
+
+`ocptool` has been removed from this repository; `ocmt` supersedes it. There is
+no compatibility wrapper or alias. Replace `openshift/ocptool` with
+`openshift/ocmt` in commands, PATH installations and automation. Remove any old
+locally installed copy yourself; updating this checkout does not remove copies
+elsewhere.
+
+The `capacity`, `nstop`, `ptop` and `free` modes remain available. Run
+`./openshift/ocmt --help` and review the options and accounting differences above.
+Do not assume identical output or numerical results: update output parsers and
+validate reports before relying on them operationally. `ocmt` uses only the Python
+standard library and does not require `tabulate`.
