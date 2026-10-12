@@ -2,7 +2,14 @@
 
 Small command-line helpers for Linux administration, troubleshooting and OpenShift.
 Commands intentionally have no `.sh` or `.py` extension.
-Copyable teaching templates live separately in `templates/`.
+Copyable teaching templates live separately in `templates/`; concrete workflow
+demonstrations live in `demos/`.
+
+**Use at your own risk.** Anyone executing any script in this repository, including
+demos and copied or modified templates, assumes responsibility for its execution
+and consequences. Scripts are provided as-is, without warranty; the authors and
+contributors accept no liability for damage, data loss or service interruption
+arising from their use.
 
 ## Commands
 
@@ -23,6 +30,18 @@ Copyable teaching templates live separately in `templates/`.
 
 See the [command guide](docs/commands.md) for options, examples, dependencies,
 permissions, exit codes and limitations.
+
+`ocptool` has been removed and is superseded by [`ocmt`](openshift/ocmt).
+Update existing invocations to `ocmt`; there is no compatibility wrapper. See the
+[migration notes](docs/commands.md#migrating-from-ocptool) before updating automation.
+
+## Demos
+
+[`demos/demo-labctl.sh`](demos/demo-labctl.sh) demonstrates installing Labctl,
+downloading an image, creating and accessing a lab VM, grading, and deleting the
+lab. It executes real commands, including forced lab deletion; it is not a dry-run.
+Read the [demo guide](docs/demos.md) for prerequisites, local assumptions and risks
+before running it.
 
 ## Demo template
 
@@ -58,6 +77,8 @@ the commands you use; there is no repository-wide runtime package installation.
 linux/                 Linux and certificate commands
 openshift/             Cluster commands
 templates/             Copyable workflow demonstration templates
+demos/                 Concrete workflow demos (currently Labctl)
+docs/demos.md          Demo prerequisites, execution and safety notes
 docs/commands.md       Command reference and operational limits
 tests/                 Offline regression tests and loopback TLS integration
 .github/workflows/     Pull-request validation
