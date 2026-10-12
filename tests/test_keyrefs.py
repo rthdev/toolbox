@@ -6,7 +6,7 @@ import subprocess
 import sys
 import unittest
 
-TOOL = Path(__file__).resolve().parents[1] / "linux/keyrefs"
+TOOL = Path(__file__).resolve().parents[1] / "debug/keyrefs"
 
 
 def load_tool():

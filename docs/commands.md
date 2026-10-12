@@ -98,9 +98,9 @@ revision ranges, argument validation and failure handling.
 ## `keyrefs`: kernel key-reference evidence
 
 ```bash
-python3 linux/keyrefs --help                 # no drgn import needed
-sudo drgn -k ./linux/keyrefs --deep 01234567
-drgn -c vmcore -s vmlinux ./linux/keyrefs --reverse --cache kmalloc-256 01234567
+python3 debug/keyrefs --help                 # no drgn import needed
+sudo drgn -k ./debug/keyrefs --deep 01234567
+drgn -c vmcore -s vmlinux ./debug/keyrefs --reverse --cache kmalloc-256 01234567
 ```
 
 Self-contained, read-only Python 3.9+ drgn diagnostic. Resolves hexadecimal serials

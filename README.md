@@ -19,7 +19,6 @@ arising from their use.
 | [`certinfo`](linux/certinfo) | TLS certificate CN, issuer, expiration and SANs | Bash, OpenSSL, GNU coreutils |
 | [`findav`](linux/findav) | Find files starting with an Ansible Vault header | Bash, GNU findutils/coreutils |
 | [`gencl`](linux/gencl) | Print a tag-grouped Git changelog | Python 3, Git |
-| [`keyrefs`](linux/keyrefs) | Read-only kernel key-reference evidence and bounded allocated-slab pointer candidates | Python 3.9+, drgn, matching kernel debug information |
 | [`qrm`](linux/qrm) | List Quay repositories/tags or delete a tag with confirmation | Python 3.9+, Requests, Quay HTTPS API |
 | [`mcm`](openshift/mcm) | Store cluster entries and run shell commands across them | Python 3.9+, PyYAML, `oc`, shell |
 | [`ogn`](openshift/ogn) | List node capacity, roles, region and zone | Bash, `oc`, jq, awk |
@@ -35,6 +34,15 @@ permissions, exit codes and limitations.
 `ocptool` has been removed and is superseded by [`ocmt`](openshift/ocmt).
 Update existing invocations to `ocmt`; there is no compatibility wrapper. See the
 [migration notes](docs/commands.md#migrating-from-ocptool) before updating automation.
+
+## Specialised debugging
+
+`debug/` contains specialised diagnostics rather than everyday administration
+helpers. [`keyrefs`](debug/keyrefs) collects read-only kernel key-reference
+evidence and bounded allocated-slab pointer candidates. It requires Python 3.9+,
+drgn, matching kernel debug information and permission to read the live kernel
+(normally root) or a selected dump. Read the [keyrefs guide](docs/keyrefs.md)
+for prerequisites, scope and limitations before use.
 
 ## Demos
 
@@ -77,6 +85,7 @@ the commands you use; there is no repository-wide runtime package installation.
 ```text
 linux/                 Linux and certificate commands
 openshift/             Cluster commands
+debug/                 Specialised debugging and kernel diagnostics
 templates/             Copyable workflow demonstration templates
 demos/                 Concrete workflow demos (currently Labctl)
 docs/demos.md          Demo prerequisites, execution and safety notes

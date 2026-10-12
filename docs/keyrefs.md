@@ -1,17 +1,17 @@
 # `keyrefs`: read-only kernel key-reference evidence
 
-Copy `linux/keyrefs` alone; it has no repository dependencies. Python 3.9+ is
+Copy `debug/keyrefs` alone; it has no repository dependencies. Python 3.9+ is
 required. Actual collection runs inside drgn with matching kernel debug information
 and permission to read the live kernel (normally root) or the selected dump.
 The drgn boundary uses the 0.2.0 allocated-slab APIs; unsupported layouts/helpers
 produce partial warnings rather than guessed offsets. Help needs only Python.
 
 ```bash
-python3 linux/keyrefs --help
-sudo drgn -k ./linux/keyrefs 01234567 07654321
-sudo drgn -k ./linux/keyrefs --deep --verbose 01234567
-drgn -c /path/vmcore -s /path/vmlinux ./linux/keyrefs --deep 01234567
-sudo drgn -k ./linux/keyrefs --reverse --cache kmalloc-256 --cache filp \
+python3 debug/keyrefs --help
+sudo drgn -k ./debug/keyrefs 01234567 07654321
+sudo drgn -k ./debug/keyrefs --deep --verbose 01234567
+drgn -c /path/vmcore -s /path/vmlinux ./debug/keyrefs --deep 01234567
+sudo drgn -k ./debug/keyrefs --reverse --cache kmalloc-256 --cache filp \
   --max-bytes 16777216 --max-objects 100000 --max-hits 200 --timeout 30 \
   --json --output /root/keyrefs-report.json 01234567
 ```
