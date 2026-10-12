@@ -131,9 +131,10 @@ Unknown usage is not compared numerically with the observed reference count.
 
 ## Live-kernel validation
 
-The consolidated tool was exercised on Rocky Linux 9.8 x86_64, running
-`5.14.0-687.17.1.el9_8.x86_64`, with matching debug information and drgn 0.2.0
-under Python 3.9.25. Real fixtures covered task-held revoked/expired sessions,
+The consolidated tool was exercised on Rocky Linux 9.8 x86_64 with matching
+kernel debug information and drgn 0.2.0 under Python 3.9.25. Usage is not pinned
+to a particular 9.8 kernel patch version; use debug information matching the
+kernel being inspected. Real fixtures covered task-held revoked/expired sessions,
 open-file credentials, mmap-held files after FD closure, an incoming keyring link,
 and a file retained only by a Unix-socket SCM_RIGHTS message queue.
 
