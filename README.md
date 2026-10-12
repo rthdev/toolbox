@@ -35,6 +35,15 @@ permissions, exit codes and limitations.
 Update existing invocations to `ocmt`; there is no compatibility wrapper. See the
 [migration notes](docs/commands.md#migrating-from-ocptool) before updating automation.
 
+## Specialised debugging
+
+`debug/` contains specialised diagnostics rather than everyday administration
+helpers. [`keyrefs`](debug/keyrefs) collects read-only kernel key-reference
+evidence and bounded allocated-slab pointer candidates. It requires Python 3.9+,
+drgn, matching kernel debug information and permission to read the live kernel
+(normally root) or a selected dump. Read the [keyrefs guide](docs/keyrefs.md)
+for prerequisites, scope and limitations before use.
+
 ## Demos
 
 [`demos/demo-labctl.sh`](demos/demo-labctl.sh) demonstrates installing Labctl,
@@ -76,6 +85,7 @@ the commands you use; there is no repository-wide runtime package installation.
 ```text
 linux/                 Linux and certificate commands
 openshift/             Cluster commands
+debug/                 Specialised debugging and kernel diagnostics
 templates/             Copyable workflow demonstration templates
 demos/                 Concrete workflow demos (currently Labctl)
 docs/demos.md          Demo prerequisites, execution and safety notes

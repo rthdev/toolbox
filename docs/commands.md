@@ -95,6 +95,22 @@ Requires Python 3 and Git. Generates Markdown from the caller's local repository
 without modifying tags or commits. See the [gencl guide](gencl.md) for tag ordering,
 revision ranges, argument validation and failure handling.
 
+## `keyrefs`: kernel key-reference evidence
+
+```bash
+python3 debug/keyrefs --help                 # no drgn import needed
+sudo drgn -k ./debug/keyrefs --deep 01234567
+drgn -c vmcore -s vmlinux ./debug/keyrefs --reverse --cache kmalloc-256 01234567
+```
+
+Self-contained, read-only Python 3.9+ drgn diagnostic. Resolves hexadecimal serials
+in the global kernel serial tree, then reports task/file credential references and
+incoming keyring links. Optional allocated-slab reverse scanning finds pointer
+candidates, **not proven owning references**. Requires matching debug information
+and kernel-memory access (normally root for live kernels). Exit **3** means partial
+or bounded/truncated evidence; unknown holders alone do not imply failure or leaks.
+See the [keyrefs guide](keyrefs.md) for budgets, JSON, secure saved reports and limits.
+
 ## `qrm`: Quay repository and tag requests
 
 ```bash
